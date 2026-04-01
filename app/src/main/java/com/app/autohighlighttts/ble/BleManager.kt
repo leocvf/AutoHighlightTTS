@@ -30,7 +30,7 @@ class BleManager(private val context: Context) {
 
     companion object {
         private const val TAG = "BleManager"
-        private const val TARGET_HINT = "X4"
+        private val TARGET_NAME_HINTS = listOf("CrossPoint-X4-TTS", "X4")
         private const val DEFAULT_ATT_MTU = 23
         private const val ATT_WRITE_OVERHEAD = 3
         private const val MAX_RECONNECT_ATTEMPTS = 5
@@ -146,7 +146,7 @@ class BleManager(private val context: Context) {
             Log.d(TAG, "onScanResult name=$name address=${result.device.address}")
             _statusDetail.value =
                 "Found ${result.device.address} name='${name.ifBlank { "unknown" }}' rssi=${result.rssi} count=$discoveredCount filterByService=$serviceFilterEnabled"
-            if (name.contains(TARGET_HINT, ignoreCase = true)) {
+            if (matchesTargetName(name)) {
                 stopScan()
                 connect(result.device)
             }
@@ -196,7 +196,7 @@ class BleManager(private val context: Context) {
         _connectionState.value = "SCANNING"
         isScanning = true
         discoveredCount = 0
-        _statusDetail.value = "Starting scan; requires device name containing '$TARGET_HINT'"
+        _statusDetail.value = "Starting scan; expected names include ${TARGET_NAME_HINTS.joinToString()}"
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -213,6 +213,10 @@ class BleManager(private val context: Context) {
         mainHandler.removeCallbacks(scanTimeoutRunnable)
         mainHandler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
         Log.d(TAG, "BLE scan started filterByService=$serviceFilterEnabled")
+    }
+
+    private fun matchesTargetName(name: String): Boolean {
+        return TARGET_NAME_HINTS.any { hint -> name.contains(hint, ignoreCase = true) }
     }
 
     @SuppressLint("MissingPermission")
