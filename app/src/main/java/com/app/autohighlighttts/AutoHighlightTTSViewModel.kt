@@ -29,7 +29,11 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     private val bleManager = BleManager(context)
     private val ttsSyncBridge = TtsSyncBridge(
         bleManager = bleManager,
-        sendPositionPackets = false
+        // crosspoint-enhanced-reading-mod (leocvf fork) currently documents
+        // load_text + position as the supported remote-reader protocol.
+        // Keep streaming disabled for interoperability with that firmware branch.
+        sendPositionPackets = true,
+        streamingEnabled = false
     )
 
     val connectionState: StateFlow<String> = bleManager.connectionState
