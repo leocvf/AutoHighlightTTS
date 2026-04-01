@@ -42,6 +42,8 @@ class TtsSyncBridgeTest {
                 .put("type", "stream_chunk")
                 .put("sessionId", "s")
                 .put("docId", "d")
+                .put("seq", chunk.sequenceId)
+                .put("offset", chunk.startOffset)
                 .put("sequenceId", chunk.sequenceId)
                 .put("chunkId", chunk.chunkId)
                 .put("start", chunk.startOffset)
@@ -74,6 +76,11 @@ class TtsSyncBridgeTest {
         assertTrue(types.contains("stream_chunk"))
         assertTrue(types.contains("stream_commit"))
         assertTrue(types.contains("stream_seek"))
+        val firstChunk = transport.packets.first { it.optString("type") == "stream_chunk" }
+        assertTrue(firstChunk.has("seq"))
+        assertTrue(firstChunk.has("offset"))
+        val firstCommit = transport.packets.first { it.optString("type") == "stream_commit" }
+        assertTrue(firstCommit.has("uptoSeq"))
     }
 
     @Test

@@ -17,12 +17,17 @@ ordering and prebuffering.
 
 ### Stream packet examples
 ```json
-{"type":"stream_start","sessionId":"2f7...","docId":"chapter-12","streamVersion":2,"totalChars":14329,"chunkCount":107}
-{"type":"stream_chunk","sessionId":"2f7...","docId":"chapter-12","sequenceId":18,"chunkId":18,"start":2190,"end":2358,"checksum":-1581904,"text":"..."}
-{"type":"stream_commit","sessionId":"2f7...","committedSeq":18}
-{"type":"stream_seek","sessionId":"2f7...","start":7120,"end":7154}
+{"type":"stream_start","sessionId":"2f7...","docId":"chapter-12","startOffset":0,"streamVersion":2,"totalChars":14329,"chunkCount":107}
+{"type":"stream_chunk","sessionId":"2f7...","docId":"chapter-12","seq":18,"offset":2190,"sequenceId":18,"chunkId":18,"start":2190,"end":2358,"checksum":-1581904,"text":"..."}
+{"type":"stream_commit","sessionId":"2f7...","uptoSeq":18,"committedSeq":18}
+{"type":"stream_seek","sessionId":"2f7...","offset":7120,"start":7120,"end":7154}
 {"type":"stream_end","sessionId":"2f7..."}
 ```
+
+For `leocvf/crosspoint-enhanced-reading-mod`, the required streaming keys are:
+`stream_start.startOffset`, `stream_chunk.seq`, `stream_chunk.offset`,
+`stream_commit.uptoSeq`, and `stream_seek.offset`. The Android app includes these
+plus compatibility aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mixed firmware builds.
 
 ### Chunking and pacing
 - Chunks are sentence-aware first, then word-boundary aware.
