@@ -55,7 +55,7 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
 
     fun hasRequiredBlePermissions(): Boolean = bleManager.hasRequiredPermissions()
 
-    fun scanBleDevices() = bleManager.scanForDevices()
+    fun scanBleDevices(includeAllDevices: Boolean = true) = bleManager.scanForDevices(includeAllDevices)
 
     fun connectBle(device: ScannedDevice) = bleManager.connect(device.bluetoothDevice)
 

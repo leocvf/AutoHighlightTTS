@@ -185,7 +185,7 @@ class BleManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun scanForDevices() {
+    fun scanForDevices(includeAllDevices: Boolean = false) {
         if (!hasRequiredPermissions()) {
             _connectionState.value = "MISSING_PERMISSION"
             Log.w(TAG, "scanForDevices blocked: missing permissions")
@@ -200,11 +200,16 @@ class BleManager(private val context: Context) {
             return
         }
 
+        serviceFilterEnabled = !includeAllDevices
         _connectionState.value = "SCANNING"
         isScanning = true
         discoveredCount = 0
         _scannedDevices.value = emptyList()
-        _statusDetail.value = "Starting scan; expected names include ${TARGET_NAME_HINTS.joinToString()}"
+        _statusDetail.value = if (serviceFilterEnabled) {
+            "Starting filtered scan; expected names include ${TARGET_NAME_HINTS.joinToString()}"
+        } else {
+            "Starting unfiltered scan for all nearby BLE devices"
+        }
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
