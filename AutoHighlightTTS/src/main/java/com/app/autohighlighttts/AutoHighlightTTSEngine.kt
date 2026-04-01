@@ -101,15 +101,29 @@ class AutoHighlightTTSEngine {
         totalWords = countWords(mainText)
 
         // Split text into paragraphs using regex
+        var searchFromCharIndex = 0
         listOfStringOfParagraph = mainText.split("\\.\\s*".toRegex())
             // Filter out empty paragraphs
             .filter { it.isNotEmpty() }
             // Map each paragraph to a ParagraphModel
             .mapIndexed { _, paragraph ->
                 // Calculate word count and range for each paragraph
-                val startWordIndex = countWords(mainText.substring(0, mainText.indexOf(paragraph)))
+                val startWordIndex = countWords(mainText.substring(0, searchFromCharIndex))
                 val endWordIndex = startWordIndex + countWords(paragraph) - 1
-                ParagraphModel(paragraph, countWords(paragraph), startWordIndex, endWordIndex)
+                val sentenceStartCharIndex = mainText.indexOf(paragraph, searchFromCharIndex)
+                    .takeIf { it >= 0 }
+                    ?: mainText.indexOf(paragraph).coerceAtLeast(0)
+                val sentenceEndCharIndexExclusive =
+                    (sentenceStartCharIndex + paragraph.length).coerceAtMost(mainText.length)
+                searchFromCharIndex = sentenceEndCharIndexExclusive
+                ParagraphModel(
+                    text = paragraph,
+                    totalWordOfText = countWords(paragraph),
+                    startIndex = startWordIndex,
+                    endIndex = endWordIndex,
+                    startCharIndex = sentenceStartCharIndex,
+                    endCharIndexExclusive = sentenceEndCharIndexExclusive
+                )
             }
 
         return this
@@ -132,11 +146,7 @@ class AutoHighlightTTSEngine {
             autoHighlightTTS.play(currentSpokenSentenceCopy)
 
             // Highlight the text corresponding to the current sentence
-            highlightTextPair.value =
-                getStartAndEndOfSubstring(
-                    mainText,
-                    listOfStringOfParagraph[currentCount.intValue].text
-                )
+            highlightTextPair.value = currentSentenceCharRange()
 
             playOrPauseTTS.value = true
 
@@ -144,10 +154,7 @@ class AutoHighlightTTSEngine {
             autoHighlightTTS.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     onEachSentenceStartListener?.invoke()
-                    val sentenceRange = getStartAndEndOfSubstring(
-                        mainText,
-                        listOfStringOfParagraph[currentCount.intValue].text
-                    )
+                    val sentenceRange = currentSentenceCharRange()
                     Log.d(TAG, "onStart utteranceId=$utteranceId sentenceStart=${sentenceRange.first} sentenceEnd=${sentenceRange.second}")
                     onSpokenRangeListener?.invoke(
                         utteranceId,
@@ -173,10 +180,7 @@ class AutoHighlightTTSEngine {
                             null, TextToSpeech.ACTION_TTS_QUEUE_PROCESSING_COMPLETED
                         )
                         // Highlight the text corresponding to the next sentence
-                        highlightTextPair.value = getStartAndEndOfSubstring(
-                            mainText,
-                            currentSpokenSentenceCopy
-                        )
+                        highlightTextPair.value = currentSentenceCharRange()
                         // Update the progress
                         updateProgress(currentCount.intValue)
                     } else {
@@ -342,9 +346,17 @@ class AutoHighlightTTSEngine {
      * [highlightFunction] is responsible for Highlight the text which are speaking.
      */
     private fun highlightFunction(): AutoHighlightTTSEngine {
-        highlightTextPair.value =
-            getStartAndEndOfSubstring(mainText, listOfStringOfParagraph[currentCount.intValue].text)
+        highlightTextPair.value = currentSentenceCharRange()
         return this
+    }
+
+    private fun currentSentenceCharRange(): Pair<Int, Int> {
+        val paragraph = listOfStringOfParagraph.getOrNull(currentCount.intValue)
+        return if (paragraph != null) {
+            Pair(paragraph.startCharIndex, paragraph.endCharIndexExclusive)
+        } else {
+            Pair(0, 0)
+        }
     }
 
     /**
