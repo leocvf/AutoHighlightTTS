@@ -5,4 +5,6 @@ data class ParagraphModel(
     val totalWordOfText: Int,
     val startIndex: Int,
     val endIndex: Int,
+    val startCharIndex: Int,
+    val endCharIndexExclusive: Int,
 )
