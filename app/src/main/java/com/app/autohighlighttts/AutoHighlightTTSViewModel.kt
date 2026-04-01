@@ -37,6 +37,19 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     val scannedDevices: StateFlow<List<ScannedDevice>> = bleManager.scannedDevices
 
     init {
+        ttsSyncBridge.setAckModeEnabled(true)
+        bleManager.onFeedbackPacket = { packet ->
+            if (packet.optString("type") == "ack") {
+                val sequenceId = when {
+                    packet.has("sequenceId") -> packet.optInt("sequenceId", -1)
+                    packet.has("highestContiguousSeq") -> packet.optInt("highestContiguousSeq", -1)
+                    else -> -1
+                }
+                if (sequenceId >= 0) {
+                    ttsSyncBridge.onAckReceived(sequenceId)
+                }
+            }
+        }
         initTTS(context)
         ttsSyncBridge.setDocId("doc-default")
         ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)

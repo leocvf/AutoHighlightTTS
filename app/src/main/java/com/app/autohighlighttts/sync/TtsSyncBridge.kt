@@ -9,54 +9,139 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.max
 
 class TtsSyncBridge(
-    private val bleManager: BleManager,
+    private val transport: CommandTransport,
     private var docId: String = "demo-001",
     private val debounceMs: Long = 150L,
-    private val sendPositionPackets: Boolean = true
+    private val sendPositionPackets: Boolean = true,
+    private val streamingEnabled: Boolean = true,
+    private val streamVersion: Int = 2
 ) {
+    constructor(
+        bleManager: BleManager,
+        docId: String = "demo-001",
+        debounceMs: Long = 150L,
+        sendPositionPackets: Boolean = true,
+        streamingEnabled: Boolean = true,
+        streamVersion: Int = 2
+    ) : this(
+        transport = BleCommandTransport(bleManager),
+        docId = docId,
+        debounceMs = debounceMs,
+        sendPositionPackets = sendPositionPackets,
+        streamingEnabled = streamingEnabled,
+        streamVersion = streamVersion
+    )
+
+    interface CommandTransport {
+        fun writeJson(packet: JSONObject): Boolean
+        fun maxPayloadBytes(): Int
+        fun pendingWriteCount(): Int
+        fun meanWriteLatencyMs(): Int
+    }
+
+    private class BleCommandTransport(private val bleManager: BleManager) : CommandTransport {
+        override fun writeJson(packet: JSONObject): Boolean = bleManager.writeJson(packet)
+        override fun maxPayloadBytes(): Int = bleManager.maxPayloadBytes()
+        override fun pendingWriteCount(): Int = bleManager.pendingWriteCount()
+        override fun meanWriteLatencyMs(): Int = bleManager.meanWriteLatencyMs()
+    }
 
     companion object {
         private const val TAG = "TtsSyncBridge"
+        private const val MIN_LOOKAHEAD_CHUNKS = 2
+        private const val MAX_LOOKAHEAD_CHUNKS = 5
+        private const val MIN_BUFFERED_CHARS = 360
+        private const val ACK_TIMEOUT_MS = 900L
+        private const val MAX_RETRY = 2
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private var pendingPosition: Pair<Int, Int>? = null
     private var positionJob: Job? = null
+    private var senderJob: Job? = null
+    private var ackMonitorJob: Job? = null
     private var lastPositionSentAt = 0L
-    private var activeSegments: List<TextSegment> = emptyList()
-    private var activeSegmentIndex: Int = -1
     private var sourceDocumentText: String = ""
     private var lastHighlightedPayload: String? = null
 
-    private data class TextSegment(
+    private var session: StreamSession? = null
+    private var ackModeEnabled: Boolean = false
+    private var lastSeekOffset: Int = 0
+
+    private val outboundQueue = ArrayDeque<JSONObject>()
+    private val ackWaiting = ConcurrentHashMap<Int, InFlightChunk>()
+    private val sentChunkSeqs = mutableSetOf<Int>()
+    private var committedSeq = -1
+
+    private var tokenBucket = 4.0
+    private var lastRefillMs = SystemClock.elapsedRealtime()
+
+    private data class StreamSession(
+        val sessionId: String,
         val docId: String,
-        val text: String,
-        val startOffset: Int,
-        val endOffsetExclusive: Int
+        val streamVersion: Int,
+        val totalChars: Int,
+        val chunks: List<StreamChunk>
     )
 
-    fun sendPing() = sendPacket(JSONObject().put("type", "ping"))
+    internal data class StreamChunk(
+        val chunkId: Int,
+        val sequenceId: Int,
+        val startOffset: Int,
+        val endOffsetExclusive: Int,
+        val text: String,
+        val checksum: Int,
+        val sentenceTail: Boolean
+    )
+
+    private data class InFlightChunk(
+        val chunk: StreamChunk,
+        var lastSentAtMs: Long,
+        var retryCount: Int
+    )
+
+    internal data class StreamMetrics(
+        var chunksSent: Int = 0,
+        var chunksRetried: Int = 0,
+        var droppedChunks: Int = 0,
+        var resyncCount: Int = 0,
+        var seekCount: Int = 0
+    )
+
+    private val metrics = StreamMetrics()
+
+    fun sendPing() = enqueuePacket(JSONObject().put("type", "ping"))
 
     fun sendClear() {
-        activeSegments = emptyList()
-        activeSegmentIndex = -1
-        sourceDocumentText = ""
-        lastHighlightedPayload = null
-        sendPacket(JSONObject().put("type", "clear"))
+        resetStreamingState()
+        enqueuePacket(JSONObject().put("type", "clear"))
     }
 
     fun setDocId(newDocId: String) {
         if (newDocId.isNotBlank()) {
             docId = newDocId
-            activeSegments = emptyList()
-            activeSegmentIndex = -1
-            sourceDocumentText = ""
-            lastHighlightedPayload = null
+            resetStreamingState()
+        }
+    }
+
+    fun setAckModeEnabled(enabled: Boolean) {
+        ackModeEnabled = enabled
+    }
+
+    fun onAckReceived(sequenceId: Int) {
+        if (!ackModeEnabled) return
+        ackWaiting.remove(sequenceId)
+        while (ackWaiting[committedSeq + 1] == null && committedSeq + 1 in sentChunkSeqs) {
+            committedSeq += 1
         }
     }
 
@@ -67,13 +152,36 @@ class TtsSyncBridge(
         }
         sourceDocumentText = text
         lastHighlightedPayload = null
-        val segments = buildLoadTextSegments(text)
-        if (segments.isEmpty()) {
+
+        if (!streamingEnabled) {
+            return buildFallbackSegments(text).isNotEmpty()
+        }
+
+        val maxJsonBytes = (transport.maxPayloadBytes() - 8).coerceAtLeast(90)
+        val chunks = buildStreamChunks(
+            text = text,
+            maxJsonBytes = maxJsonBytes,
+            softTargetTextBytes = 150
+        )
+
+        if (chunks.isEmpty()) {
             Log.w(TAG, "loadDocumentTextOnce produced no chunks")
             return false
         }
-        activeSegments = segments
-        activeSegmentIndex = -1
+
+        session = StreamSession(
+            sessionId = UUID.randomUUID().toString(),
+            docId = docId,
+            streamVersion = streamVersion,
+            totalChars = text.length,
+            chunks = chunks
+        )
+        committedSeq = -1
+        sentChunkSeqs.clear()
+        ackWaiting.clear()
+        sendStreamStart()
+        ensureBufferAround(0)
+        startAckMonitorIfNeeded()
         return true
     }
 
@@ -91,32 +199,17 @@ class TtsSyncBridge(
                 delay(debounceMs)
             }
 
-            if (!sendPositionPackets) {
-                sendHighlightedRangeAsLoadText(range.first, range.second)
+            if (!streamingEnabled) {
+                if (!sendPositionPackets) {
+                    sendHighlightedRangeAsLoadText(range.first, range.second)
+                } else {
+                    sendFallbackPosition(range.first, range.second)
+                }
                 lastPositionSentAt = SystemClock.elapsedRealtime()
                 return@launch
             }
 
-            val targetChunkIndex = findSegmentIndex(range.first)
-            if (targetChunkIndex >= 0 && targetChunkIndex != activeSegmentIndex) {
-                val switched = sendLoadTextSegment(targetChunkIndex)
-                if (!switched) {
-                    Log.w(TAG, "Failed to switch chunk for position range=$range index=$targetChunkIndex")
-                }
-            }
-
-            val activeChunk = activeSegments.getOrNull(activeSegmentIndex)
-            val startOffset = activeChunk?.startOffset ?: 0
-            val endOffset = activeChunk?.endOffsetExclusive ?: Int.MAX_VALUE
-            val localStart = (range.first - startOffset).coerceAtLeast(0)
-            val localEnd = (range.second - startOffset).coerceIn(localStart, endOffset - startOffset)
-
-            val packet = JSONObject()
-                .put("type", "position")
-                .put("docId", activeChunk?.docId ?: docId)
-                .put("start", localStart)
-                .put("end", localEnd)
-            sendPacket(packet)
+            handleStreamingRange(range.first, range.second)
             lastPositionSentAt = SystemClock.elapsedRealtime()
         }
     }
@@ -125,6 +218,217 @@ class TtsSyncBridge(
         scope.coroutineContext.cancel()
     }
 
+    private fun handleStreamingRange(start: Int, end: Int) {
+        val currentSession = session ?: return
+        val safeStart = start.coerceIn(0, currentSession.totalChars)
+        val safeEnd = end.coerceIn(safeStart, currentSession.totalChars)
+        if (kotlin.math.abs(safeStart - lastSeekOffset) > 420) {
+            metrics.seekCount += 1
+            metrics.resyncCount += 1
+            sendStreamSeek(safeStart, safeEnd)
+        }
+        lastSeekOffset = safeStart
+        ensureBufferAround(safeStart)
+        sendStreamCommit()
+    }
+
+    private fun sendStreamStart() {
+        val s = session ?: return
+        enqueuePacket(
+            JSONObject()
+                .put("type", "stream_start")
+                .put("sessionId", s.sessionId)
+                .put("docId", s.docId)
+                .put("streamVersion", s.streamVersion)
+                .put("totalChars", s.totalChars)
+                .put("chunkCount", s.chunks.size)
+        )
+    }
+
+    private fun sendStreamSeek(start: Int, end: Int) {
+        val s = session ?: return
+        enqueuePacket(
+            JSONObject()
+                .put("type", "stream_seek")
+                .put("sessionId", s.sessionId)
+                .put("start", start)
+                .put("end", end)
+        )
+    }
+
+    private fun sendStreamCommit() {
+        val s = session ?: return
+        enqueuePacket(
+            JSONObject()
+                .put("type", "stream_commit")
+                .put("sessionId", s.sessionId)
+                .put("committedSeq", committedSeq)
+        )
+    }
+
+    private fun sendStreamChunk(chunk: StreamChunk, reason: String) {
+        val s = session ?: return
+        val packet = JSONObject()
+            .put("type", "stream_chunk")
+            .put("sessionId", s.sessionId)
+            .put("docId", s.docId)
+            .put("sequenceId", chunk.sequenceId)
+            .put("chunkId", chunk.chunkId)
+            .put("start", chunk.startOffset)
+            .put("end", chunk.endOffsetExclusive)
+            .put("checksum", chunk.checksum)
+            .put("text", chunk.text)
+        enqueuePacket(packet)
+
+        sentChunkSeqs += chunk.sequenceId
+        if (ackModeEnabled) {
+            ackWaiting[chunk.sequenceId] = InFlightChunk(chunk, SystemClock.elapsedRealtime(), 0)
+        } else {
+            committedSeq = max(committedSeq, chunk.sequenceId)
+        }
+        metrics.chunksSent += 1
+        Log.d(TAG, "stream_chunk queued seq=${chunk.sequenceId} reason=$reason")
+    }
+
+    private fun sendStreamEnd() {
+        val s = session ?: return
+        enqueuePacket(
+            JSONObject()
+                .put("type", "stream_end")
+                .put("sessionId", s.sessionId)
+        )
+    }
+
+    private fun ensureBufferAround(globalOffset: Int) {
+        val s = session ?: return
+        val centerIndex = findChunkIndexForOffset(s.chunks, globalOffset)
+        if (centerIndex < 0) return
+
+        val lookahead = (MIN_LOOKAHEAD_CHUNKS + transport.pendingWriteCount()).coerceIn(
+            MIN_LOOKAHEAD_CHUNKS,
+            MAX_LOOKAHEAD_CHUNKS
+        )
+        val startIndex = (centerIndex - 1).coerceAtLeast(0)
+        val endIndex = (centerIndex + lookahead).coerceAtMost(s.chunks.lastIndex)
+
+        var bufferedChars = 0
+        for (i in startIndex..endIndex) {
+            val chunk = s.chunks[i]
+            val alreadyQueued = sentChunkSeqs.contains(chunk.sequenceId)
+            if (!alreadyQueued) {
+                sendStreamChunk(chunk, reason = if (i == centerIndex) "focus" else "window")
+            }
+            if (chunk.endOffsetExclusive > globalOffset) {
+                bufferedChars += chunk.endOffsetExclusive - max(globalOffset, chunk.startOffset)
+            }
+        }
+
+        if (bufferedChars < MIN_BUFFERED_CHARS && endIndex < s.chunks.lastIndex) {
+            val refillEnd = (endIndex + 2).coerceAtMost(s.chunks.lastIndex)
+            for (i in (endIndex + 1)..refillEnd) {
+                val chunk = s.chunks[i]
+                if (!sentChunkSeqs.contains(chunk.sequenceId)) {
+                    sendStreamChunk(chunk, reason = "refill")
+                }
+            }
+        }
+    }
+
+    private fun findChunkIndexForOffset(chunks: List<StreamChunk>, globalOffset: Int): Int {
+        return chunks.indexOfFirst { globalOffset in it.startOffset until it.endOffsetExclusive }
+            .takeIf { it >= 0 }
+            ?: chunks.lastIndex
+    }
+
+    private fun enqueuePacket(packet: JSONObject) {
+        outboundQueue.add(packet)
+        if (senderJob?.isActive != true) {
+            senderJob = scope.launch { drainOutboundQueue() }
+        }
+    }
+
+    private suspend fun drainOutboundQueue() {
+        while (scope.isActive && outboundQueue.isNotEmpty()) {
+            applyTokenRefill()
+            if (tokenBucket < 1.0) {
+                delay(18)
+                continue
+            }
+
+            val packet = outboundQueue.removeFirstOrNull() ?: continue
+            val sent = transport.writeJson(packet)
+            tokenBucket -= 1.0
+            val depth = transport.pendingWriteCount()
+            val latency = transport.meanWriteLatencyMs()
+            Log.d(
+                TAG,
+                "stream_tx sent=$sent depth=$depth latencyMs=$latency payload=$packet metrics=$metrics"
+            )
+            if (!sent) {
+                metrics.droppedChunks += 1
+                delay(35)
+            } else if (depth > 6 || latency > 65) {
+                delay(30)
+            } else {
+                delay(8)
+            }
+        }
+    }
+
+    private fun applyTokenRefill() {
+        val now = SystemClock.elapsedRealtime()
+        val elapsedMs = (now - lastRefillMs).coerceAtLeast(0)
+        lastRefillMs = now
+        val queueDepth = transport.pendingWriteCount()
+        val meanLatency = transport.meanWriteLatencyMs()
+
+        val fillRatePerSec = when {
+            queueDepth > 6 || meanLatency > 70 -> 14.0
+            queueDepth > 3 || meanLatency > 40 -> 22.0
+            else -> 30.0
+        }
+        tokenBucket = (tokenBucket + (elapsedMs / 1000.0) * fillRatePerSec).coerceAtMost(8.0)
+    }
+
+    private fun startAckMonitorIfNeeded() {
+        if (!ackModeEnabled || ackMonitorJob?.isActive == true) return
+        ackMonitorJob = scope.launch {
+            while (isActive) {
+                delay(200)
+                val now = SystemClock.elapsedRealtime()
+                ackWaiting.values.forEach { inFlight ->
+                    if (now - inFlight.lastSentAtMs >= ACK_TIMEOUT_MS && inFlight.retryCount < MAX_RETRY) {
+                        inFlight.retryCount += 1
+                        inFlight.lastSentAtMs = now
+                        metrics.chunksRetried += 1
+                        sendStreamChunk(inFlight.chunk, reason = "retry")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun sendFallbackPosition(start: Int, end: Int) {
+        val packet = JSONObject()
+            .put("type", "position")
+            .put("docId", docId)
+            .put("start", start)
+            .put("end", end)
+        enqueuePacket(packet)
+    }
+
+    private fun buildFallbackSegments(text: String): List<String> {
+        val segments = text.split("\n\n").filter { it.isNotBlank() }
+        if (segments.isNotEmpty()) {
+            enqueuePacket(
+                JSONObject()
+                    .put("type", "load_text")
+                    .put("docId", docId)
+                    .put("text", segments.first())
+            )
+        }
+        return segments
+    }
 
     private fun sendHighlightedRangeAsLoadText(start: Int, end: Int) {
         if (sourceDocumentText.isBlank()) return
@@ -139,120 +443,183 @@ class TtsSyncBridge(
             return
         }
 
-        val packet = JSONObject()
-            .put("type", "load_text")
-            .put("docId", "$docId#live")
-            .put("text", highlightedText)
-
-        sendPacket(packet)
+        enqueuePacket(
+            JSONObject()
+                .put("type", "load_text")
+                .put("docId", "$docId#live")
+                .put("text", highlightedText)
+        )
         lastHighlightedPayload = payloadKey
     }
 
-    private fun sendPacket(packet: JSONObject) {
-        val sent = bleManager.writeJson(packet)
-        Log.d(TAG, "outboundCommand sent=$sent payload=$packet")
+    private fun resetStreamingState() {
+        sendStreamEnd()
+        session = null
+        sourceDocumentText = ""
+        outboundQueue.clear()
+        ackWaiting.clear()
+        sentChunkSeqs.clear()
+        committedSeq = -1
+        lastSeekOffset = 0
+        lastHighlightedPayload = null
     }
 
-    private fun sendLoadTextSegment(index: Int): Boolean {
-        val chunk = activeSegments.getOrNull(index) ?: return false
-        val sent = bleManager.writeJson(
-            JSONObject()
-                .put("type", "load_text")
-                .put("docId", chunk.docId)
-                .put("text", chunk.text)
-        )
-        if (sent) {
-            activeSegmentIndex = index
+    internal fun buildStreamChunks(
+        text: String,
+        maxJsonBytes: Int,
+        softTargetTextBytes: Int
+    ): List<StreamChunk> {
+        if (text.isBlank()) return emptyList()
+        val paragraphRanges = splitParagraphRanges(text)
+        val sentenceRanges = paragraphRanges.flatMap { paragraph ->
+            splitSentenceRanges(text, paragraph.first, paragraph.second)
         }
-        return sent
-    }
 
-    private fun findSegmentIndex(globalOffset: Int): Int {
-        if (activeSegments.isEmpty()) return -1
-        return activeSegments.indexOfFirst { chunk ->
-            globalOffset >= chunk.startOffset && globalOffset < chunk.endOffsetExclusive
-        }.takeIf { it >= 0 } ?: (activeSegments.size - 1)
-    }
+        val chunks = mutableListOf<StreamChunk>()
+        var sequence = 0
+        var chunkId = 0
+        var currentStart = -1
+        var currentEnd = -1
 
-    private fun buildLoadTextSegments(text: String): List<TextSegment> {
-        val paragraphRanges = buildParagraphRanges(text)
-        val maxPayloadBytes = 220
-        val chunks = mutableListOf<TextSegment>()
-        var chunkIndex = 0
-        paragraphRanges.forEach { range ->
-            var start = range.first
-            val paragraphEnd = range.second
-            while (start < paragraphEnd) {
-                val chunkDocId = "$docId#$chunkIndex"
-                val end = findChunkEndIndex(text, start, paragraphEnd, maxPayloadBytes, chunkDocId)
-                if (end <= start) {
-                    break
-                }
-                val candidate = text.substring(start, end)
-                chunks.add(
-                    TextSegment(
-                        docId = chunkDocId,
-                        text = candidate,
-                        startOffset = start,
-                        endOffsetExclusive = end
-                    )
-                )
-                start = end
-                chunkIndex++
+        fun flush(sentenceTail: Boolean) {
+            if (currentStart < 0 || currentEnd <= currentStart) return
+            val payloadText = text.substring(currentStart, currentEnd)
+            chunks += StreamChunk(
+                chunkId = chunkId++,
+                sequenceId = sequence++,
+                startOffset = currentStart,
+                endOffsetExclusive = currentEnd,
+                text = payloadText,
+                checksum = payloadText.hashCode(),
+                sentenceTail = sentenceTail
+            )
+            currentStart = -1
+            currentEnd = -1
+        }
+
+        sentenceRanges.forEach { sentence ->
+            if (currentStart < 0) {
+                currentStart = sentence.first
+                currentEnd = sentence.second
+                return@forEach
+            }
+
+            val candidateEnd = sentence.second
+            val candidateText = text.substring(currentStart, candidateEnd)
+            val overSoftTarget = candidateText.toByteArray(Charsets.UTF_8).size > softTargetTextBytes
+            val overHardTarget = !fitsStreamChunkPayload(text.substring(currentStart, candidateEnd), maxJsonBytes)
+
+            if (overSoftTarget || overHardTarget) {
+                flush(sentenceTail = true)
+                currentStart = sentence.first
+                currentEnd = sentence.second
+            } else {
+                currentEnd = sentence.second
             }
         }
-        return chunks
+        flush(sentenceTail = true)
+
+        return chunks.flatMap { splitChunkIfNeeded(it, maxJsonBytes) }
     }
 
-    private fun buildParagraphRanges(text: String): List<Pair<Int, Int>> {
+    private fun splitChunkIfNeeded(chunk: StreamChunk, maxJsonBytes: Int): List<StreamChunk> {
+        if (fitsStreamChunkPayload(chunk.text, maxJsonBytes)) return listOf(chunk)
+
+        val split = mutableListOf<StreamChunk>()
+        var cursor = 0
+        var seq = chunk.sequenceId
+        var cid = chunk.chunkId * 100
+
+        while (cursor < chunk.text.length) {
+            var end = (cursor + 140).coerceAtMost(chunk.text.length)
+            var accepted = -1
+            while (end > cursor) {
+                val candidate = chunk.text.substring(cursor, end)
+                if (fitsStreamChunkPayload(candidate, maxJsonBytes)) {
+                    accepted = end
+                    break
+                }
+                end--
+            }
+            if (accepted <= cursor) break
+            val boundary = preferredBoundary(chunk.text, cursor, accepted)
+            val textPart = chunk.text.substring(cursor, boundary)
+            split += StreamChunk(
+                chunkId = cid++,
+                sequenceId = seq++,
+                startOffset = chunk.startOffset + cursor,
+                endOffsetExclusive = chunk.startOffset + boundary,
+                text = textPart,
+                checksum = textPart.hashCode(),
+                sentenceTail = textPart.lastOrNull() in listOf('.', '!', '?', '\n')
+            )
+            cursor = boundary
+        }
+
+        return if (split.isEmpty()) listOf(chunk) else split
+    }
+
+    private fun preferredBoundary(text: String, start: Int, maxEnd: Int): Int {
+        val sentenceBoundary = text.substring(start, maxEnd).indexOfLast { it == '.' || it == '!' || it == '?' }
+        if (sentenceBoundary > 0) return start + sentenceBoundary + 1
+
+        val wordBoundary = text.substring(start, maxEnd).indexOfLast { it.isWhitespace() }
+        if (wordBoundary > 16) return start + wordBoundary + 1
+
+        return maxEnd
+    }
+
+    private fun fitsStreamChunkPayload(chunkText: String, maxJsonBytes: Int): Boolean {
+        val probe = JSONObject()
+            .put("type", "stream_chunk")
+            .put("sessionId", "s")
+            .put("docId", "d")
+            .put("sequenceId", 1)
+            .put("chunkId", 1)
+            .put("start", 0)
+            .put("end", chunkText.length)
+            .put("checksum", chunkText.hashCode())
+            .put("text", chunkText)
+        return probe.toString().toByteArray(Charsets.UTF_8).size <= maxJsonBytes
+    }
+
+    private fun splitParagraphRanges(text: String): List<Pair<Int, Int>> {
         val ranges = mutableListOf<Pair<Int, Int>>()
         var start = 0
         while (start < text.length) {
             val paragraphBreak = text.indexOf("\n\n", start)
             val end = if (paragraphBreak >= 0) paragraphBreak + 2 else text.length
-            if (end > start) {
-                ranges.add(start to end)
-            }
+            if (end > start) ranges += start to end
             start = end
         }
         return ranges
     }
 
-    private fun findChunkEndIndex(
-        text: String,
-        start: Int,
-        maxEnd: Int,
-        maxPayloadBytes: Int,
-        chunkDocId: String
-    ): Int {
-        var low = start + 1
-        var high = maxEnd
-        var best = -1
+    private fun splitSentenceRanges(text: String, start: Int, end: Int): List<Pair<Int, Int>> {
+        val ranges = mutableListOf<Pair<Int, Int>>()
+        var cursor = start
+        while (cursor < end) {
+            val sentenceEnd = findSentenceEnd(text, cursor, end)
+            if (sentenceEnd <= cursor) break
+            ranges += cursor to sentenceEnd
+            cursor = sentenceEnd
+        }
+        return if (ranges.isEmpty()) listOf(start to end) else ranges
+    }
 
-        while (low <= high) {
-            val mid = (low + high) / 2
-            val candidate = text.substring(start, mid)
-            val payloadBytes = JSONObject()
-                .put("type", "load_text")
-                .put("docId", chunkDocId)
-                .put("text", candidate)
-                .toString()
-                .toByteArray(Charsets.UTF_8)
-                .size
-            if (payloadBytes <= maxPayloadBytes) {
-                best = mid
-                low = mid + 1
-            } else {
-                high = mid - 1
+    private fun findSentenceEnd(text: String, start: Int, maxEnd: Int): Int {
+        var i = start
+        while (i < maxEnd) {
+            val c = text[i]
+            if (c == '.' || c == '!' || c == '?') {
+                var j = i + 1
+                while (j < maxEnd && text[j].isWhitespace()) {
+                    j++
+                }
+                return j
             }
+            i++
         }
-
-        if (best <= start) return start
-        val preferredSplit = text.substring(start, best).indexOfLast { it == ' ' || it == '\n' }
-        return if (preferredSplit > 20) {
-            start + preferredSplit + 1
-        } else {
-            best
-        }
+        return maxEnd
     }
 }
