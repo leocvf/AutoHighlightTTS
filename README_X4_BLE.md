@@ -35,7 +35,8 @@ ordering and prebuffering.
 - **ACK mode (optional):** enable retransmit on timeout using sequence IDs.
 - **Best-effort mode:** stream remains idempotent; key window chunks are resent on seek/resync.
 - Android now listens for feedback notify packets such as
-  `{"type":"ack","sequenceId":<int>}` and forwards ACK sequence IDs to the stream bridge.
+  `{"type":"ack","sequenceId":<int>}` (or `highestContiguousSeq` alias) and forwards ACK
+  sequence IDs to the stream bridge.
 
 ### Migration and compatibility
 - Legacy `load_text` + `position` behavior remains available behind a bridge flag
