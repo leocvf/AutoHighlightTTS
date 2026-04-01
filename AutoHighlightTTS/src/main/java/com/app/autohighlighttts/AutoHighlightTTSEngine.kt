@@ -52,7 +52,8 @@ class AutoHighlightTTSEngine {
     private var onErrorListener: ((String) -> Unit)? = null
     private var onHighlightListener: ((Pair<Int, Int>) -> Unit)? = null
     private var onSpokenRangeListener: ((String?, Int, Int, Boolean) -> Unit)? = null
-    private var preferSentenceLevelSync: Boolean = true
+    private var preferSentenceLevelSync: Boolean = false
+    private var currentUtteranceOffsetInSentence: Int = 0
 
 
     /**
@@ -120,27 +121,8 @@ class AutoHighlightTTSEngine {
      */
     fun playTextToSpeech(): AutoHighlightTTSEngine {
         if (mainText.isNotBlank()) {
-            // Adjust currentSpokenSentenceCopy if a stop position is set
-            currentSpokenSentenceCopy = if (stopPosition.second != 0) {
-                currentSpokenSentenceCopy.substring(stopPosition.second)
-            } else {
-                // Otherwise, set currentSpokenSentenceCopy to the next sentence
-                listOfStringOfParagraph[currentCount.intValue].text
-            }
-
-            // Play the current sentence
-            autoHighlightTTS.play(currentSpokenSentenceCopy)
-
-            // Highlight the text corresponding to the current sentence
-            highlightTextPair.value =
-                getStartAndEndOfSubstring(
-                    mainText,
-                    listOfStringOfParagraph[currentCount.intValue].text
-                )
-
-            playOrPauseTTS.value = true
-
-            // Set the UtteranceProgressListener for handling TTS events
+            // Set the UtteranceProgressListener before speaking to avoid missing
+            // callbacks for the very first spoken sentence.
             autoHighlightTTS.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     onEachSentenceStartListener?.invoke()
@@ -149,12 +131,14 @@ class AutoHighlightTTSEngine {
                         listOfStringOfParagraph[currentCount.intValue].text
                     )
                     Log.d(TAG, "onStart utteranceId=$utteranceId sentenceStart=${sentenceRange.first} sentenceEnd=${sentenceRange.second}")
-                    onSpokenRangeListener?.invoke(
-                        utteranceId,
-                        sentenceRange.first,
-                        sentenceRange.second,
-                        false
-                    )
+                    if (preferSentenceLevelSync) {
+                        onSpokenRangeListener?.invoke(
+                            utteranceId,
+                            sentenceRange.first,
+                            sentenceRange.second,
+                            false
+                        )
+                    }
                 }
 
                 override fun onDone(utteranceId: String?) {
@@ -166,6 +150,7 @@ class AutoHighlightTTSEngine {
                         // Move to the next sentence
                         currentSpokenSentenceCopy =
                             listOfStringOfParagraph[++currentCount.intValue].text
+                        currentUtteranceOffsetInSentence = 0
                         // Speak the next sentence
                         autoHighlightTTS.speak(
                             currentSpokenSentenceCopy,
@@ -215,11 +200,37 @@ class AutoHighlightTTSEngine {
                     // Invoke the onHighlightListener
                     onHighlightListener?.invoke(Pair(start, end))
                     Log.d(TAG, "onRangeStart utteranceId=$utteranceId start=$start end=$end")
-                    if (!preferSentenceLevelSync) {
-                        onSpokenRangeListener?.invoke(utteranceId, start, end, true)
-                    }
+                    val sentenceStart = getStartAndEndOfSubstring(
+                        mainText,
+                        listOfStringOfParagraph[currentCount.intValue].text
+                    ).first
+                    val absoluteStart = sentenceStart + currentUtteranceOffsetInSentence + start
+                    val absoluteEnd = sentenceStart + currentUtteranceOffsetInSentence + end
+                    onSpokenRangeListener?.invoke(utteranceId, absoluteStart, absoluteEnd, true)
                 }
             })
+
+            // Adjust currentSpokenSentenceCopy if a stop position is set
+            currentSpokenSentenceCopy = if (stopPosition.second != 0) {
+                currentUtteranceOffsetInSentence = stopPosition.second
+                currentSpokenSentenceCopy.substring(stopPosition.second)
+            } else {
+                currentUtteranceOffsetInSentence = 0
+                // Otherwise, set currentSpokenSentenceCopy to the next sentence
+                listOfStringOfParagraph[currentCount.intValue].text
+            }
+
+            // Play the current sentence
+            autoHighlightTTS.play(currentSpokenSentenceCopy)
+
+            // Highlight the text corresponding to the current sentence
+            highlightTextPair.value =
+                getStartAndEndOfSubstring(
+                    mainText,
+                    listOfStringOfParagraph[currentCount.intValue].text
+                )
+
+            playOrPauseTTS.value = true
         } else {
             onErrorListener?.invoke("Text to speech text is empty")
         }
@@ -382,7 +393,8 @@ class AutoHighlightTTSEngine {
     }
 
     /**
-     * [setPreferSentenceLevelSync] keeps sentence-level sync as the safest default.
+     * [setPreferSentenceLevelSync] allows opting into sentence-level sync on `onStart`.
+     * Word/character highlight ranges are always emitted from `onRangeStart`.
      */
     fun setPreferSentenceLevelSync(preferSentenceLevelSync: Boolean): AutoHighlightTTSEngine {
         this.preferSentenceLevelSync = preferSentenceLevelSync
