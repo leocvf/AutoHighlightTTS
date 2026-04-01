@@ -14,7 +14,7 @@ import org.json.JSONObject
 
 class TtsSyncBridge(
     private val bleManager: BleManager,
-    private val docId: String = "demo-001",
+    private var docId: String = "demo-001",
     private val debounceMs: Long = 150L
 ) {
 
@@ -24,7 +24,6 @@ class TtsSyncBridge(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private var lastLoadedText: String? = null
     private var pendingPosition: Pair<Int, Int>? = null
     private var positionJob: Job? = null
     private var lastPositionSentAt = 0L
@@ -33,12 +32,17 @@ class TtsSyncBridge(
 
     fun sendClear() = sendPacket(JSONObject().put("type", "clear"))
 
+    fun setDocId(newDocId: String) {
+        if (newDocId.isNotBlank()) {
+            docId = newDocId
+        }
+    }
+
     fun loadDocumentTextOnce(text: String): Boolean {
-        if (text == lastLoadedText) {
-            Log.d(TAG, "loadDocumentTextOnce skipped (already loaded)")
+        if (text.isBlank()) {
+            Log.w(TAG, "loadDocumentTextOnce ignored (blank text)")
             return false
         }
-        lastLoadedText = text
         val packet = JSONObject()
             .put("type", "load_text")
             .put("docId", docId)

@@ -2,6 +2,7 @@ package com.app.autohighlighttts
 
 import android.content.Context
 import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import androidx.compose.runtime.getValue
@@ -32,7 +33,10 @@ class AutoHighlightTTSEngine {
 
     lateinit var autoHighlightTTS: TextToSpeech
     lateinit var mainText: String
+    private lateinit var appContext: Context
     private lateinit var currentSpokenSentenceCopy: String
+    private var currentPitch: Float = 1f
+    private var currentSpeed: Float = 1f
 
     var playOrPauseTTS = mutableStateOf(false)
     var totalWords: Int = 0
@@ -55,9 +59,12 @@ class AutoHighlightTTSEngine {
      * Initialization of [AutoHighlightTTSEngine]
      */
     fun init(app: Context): AutoHighlightTTSEngine {
-        autoHighlightTTS = TextToSpeech(app) {
+        appContext = app.applicationContext
+        autoHighlightTTS = TextToSpeech(appContext) {
             if (it == TextToSpeech.SUCCESS) {
                 autoHighlightTTS.language = defLanguage
+                autoHighlightTTS.setPitch(currentPitch)
+                autoHighlightTTS.setSpeechRate(currentSpeed)
             }
         }
         return this
@@ -390,8 +397,40 @@ class AutoHighlightTTSEngine {
      * twice the normal speech rate).
      */
     fun setPitchAndSpeed(pitch: Float = 1f, speed: Float = 1f): AutoHighlightTTSEngine {
+        currentPitch = pitch
+        currentSpeed = speed
         autoHighlightTTS.setPitch(pitch)
         autoHighlightTTS.setSpeechRate(speed)
+        return this
+    }
+
+    fun getAvailableEngines(): List<TextToSpeech.EngineInfo> {
+        return autoHighlightTTS.engines.orEmpty()
+    }
+
+    fun setEngine(enginePackageName: String): AutoHighlightTTSEngine {
+        pauseTextToSpeech()
+        autoHighlightTTS.shutdown()
+        autoHighlightTTS = TextToSpeech(appContext, { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                autoHighlightTTS.language = defLanguage
+                autoHighlightTTS.setPitch(currentPitch)
+                autoHighlightTTS.setSpeechRate(currentSpeed)
+            }
+        }, enginePackageName)
+        return this
+    }
+
+    fun getAvailableVoices(): List<Voice> {
+        return autoHighlightTTS.voices
+            ?.sortedWith(compareBy({ it.locale?.displayName ?: "" }, { it.name }))
+            .orEmpty()
+    }
+
+    fun setVoiceByName(voiceName: String): AutoHighlightTTSEngine {
+        autoHighlightTTS.voices?.firstOrNull { it.name == voiceName }?.let {
+            autoHighlightTTS.voice = it
+        }
         return this
     }
 }

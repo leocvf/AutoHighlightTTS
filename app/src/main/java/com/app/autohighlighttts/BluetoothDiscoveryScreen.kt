@@ -31,7 +31,10 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 
 @Composable
-fun BluetoothDiscoveryScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
+fun BluetoothDiscoveryScreen(
+    modifier: Modifier = Modifier,
+    viewModel: AutoHighlightTTSViewModel = hiltViewModel()
+) {
     val context = LocalContext.current
     val connectionState by viewModel.connectionState.collectAsState()
     val statusDetail by viewModel.bleStatusDetail.collectAsState()
@@ -55,7 +58,7 @@ fun BluetoothDiscoveryScreen(viewModel: AutoHighlightTTSViewModel = hiltViewMode
     }
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)

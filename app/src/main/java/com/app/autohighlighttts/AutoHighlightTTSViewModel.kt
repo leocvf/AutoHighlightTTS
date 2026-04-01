@@ -1,6 +1,9 @@
 package com.app.autohighlighttts
 
 import android.content.Context
+import android.net.Uri
+import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import com.app.autohighlighttts.ble.BleManager
@@ -21,6 +24,7 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     }
 
     lateinit var instanceOfTTS: AutoHighlightTTSEngine
+    private val appContext: Context = context
 
     private val bleManager = BleManager(context)
     private val ttsSyncBridge = TtsSyncBridge(bleManager)
@@ -71,6 +75,37 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
 
     fun sendPosition(start: Int, end: Int) {
         ttsSyncBridge.onSpokenRangeChanged(start, end)
+    }
+
+    fun updateNarrationText(text: String) {
+        ttsSyncBridge.setDocId("doc-${text.hashCode()}")
+        instanceOfTTS.setText(text)
+        ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
+    }
+
+    fun updatePitchAndSpeed(pitch: Float, speed: Float) {
+        instanceOfTTS.setPitchAndSpeed(pitch, speed)
+    }
+
+    fun availableEngines(): List<TextToSpeech.EngineInfo> = instanceOfTTS.getAvailableEngines()
+
+    fun selectEngine(enginePackageName: String) {
+        instanceOfTTS.setEngine(enginePackageName)
+    }
+
+    fun availableVoices(): List<Voice> = instanceOfTTS.getAvailableVoices()
+
+    fun selectVoice(voiceName: String) {
+        instanceOfTTS.setVoiceByName(voiceName)
+    }
+
+    fun loadEpub(uri: Uri): String {
+        ttsSyncBridge.setDocId(uri.lastPathSegment?.substringAfterLast('/') ?: "epub-${System.currentTimeMillis()}")
+        val text = EpubParser.readText(appContext, uri)
+        if (text.isNotBlank()) {
+            updateNarrationText(text)
+        }
+        return text
     }
 
     override fun onCleared() {
