@@ -78,6 +78,7 @@ import kotlin.math.roundToInt
 import com.app.autohighlightttssample.R
 
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TTSScreen(
     modifier: Modifier = Modifier,
@@ -282,7 +283,7 @@ fun TTSScreen(
                 modifier = Modifier.padding(top = 8.dp)
             ) {
                 OutlinedTextField(
-                    value = textAlign.name,
+                    value = textAlign.toDisplayName(),
                     onValueChange = {},
                     readOnly = true,
                     label = { Text("Text alignment") },
@@ -294,7 +295,7 @@ fun TTSScreen(
                 ExposedDropdownMenu(expanded = alignmentMenuExpanded, onDismissRequest = { alignmentMenuExpanded = false }) {
                     listOf(TextAlign.Start, TextAlign.Center, TextAlign.End, TextAlign.Justify).forEach { align ->
                         DropdownMenuItem(
-                            text = { Text(align.name) },
+                            text = { Text(align.toDisplayName()) },
                             onClick = {
                                 textAlign = align
                                 alignmentMenuExpanded = false
@@ -383,6 +384,14 @@ fun TTSScreen(
     } ?: Box(contentAlignment = Alignment.Center) {
         CircularProgressIndicator()
     }
+}
+
+private fun TextAlign.toDisplayName(): String = when (this) {
+    TextAlign.Start -> "Start"
+    TextAlign.Center -> "Center"
+    TextAlign.End -> "End"
+    TextAlign.Justify -> "Justify"
+    else -> "Start"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
