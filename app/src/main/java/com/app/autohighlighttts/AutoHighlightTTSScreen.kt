@@ -23,9 +23,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
@@ -167,7 +171,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
                 statusDetail = bleStatusDetail,
                 onConnect = {
                     if (viewModel.hasRequiredBlePermissions()) {
-                        viewModel.scanBleDevices()
+                        viewModel.scanBleDevices(includeAllDevices = true)
                     } else {
                         permissionLauncher.launch(viewModel.requiredBlePermissions())
                     }
@@ -202,6 +206,18 @@ private fun BleTestPanel(
     onPosition: (Int, Int) -> Unit
 ) {
     var slider by remember { mutableFloatStateOf(0f) }
+    var deviceMenuExpanded by remember { mutableStateOf(false) }
+    var selectedDeviceAddress by remember { mutableStateOf<String?>(null) }
+    val selectedDevice = devices.firstOrNull { it.address == selectedDeviceAddress }
+
+    LaunchedEffect(devices) {
+        if (selectedDeviceAddress == null && devices.isNotEmpty()) {
+            selectedDeviceAddress = devices.first().address
+        } else if (selectedDeviceAddress != null && devices.none { it.address == selectedDeviceAddress }) {
+            selectedDeviceAddress = devices.firstOrNull()?.address
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -219,23 +235,58 @@ private fun BleTestPanel(
         }
         if (devices.isNotEmpty()) {
             Text(
-                text = "Tap a device to connect:",
+                text = "Choose a device to connect:",
                 fontSize = 12.sp,
                 color = Color.Gray,
                 modifier = Modifier.padding(top = 8.dp)
             )
-            LazyColumn(modifier = Modifier.height(120.dp)) {
-                items(devices, key = { it.address }) { device ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onConnectDevice(device) }
-                            .padding(vertical = 6.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(text = "${device.name} (${device.address})", fontSize = 12.sp)
-                        Text(text = "${device.rssi} dBm", fontSize = 12.sp, color = Color.Gray)
+            ExposedDropdownMenuBox(
+                expanded = deviceMenuExpanded,
+                onExpandedChange = { deviceMenuExpanded = !deviceMenuExpanded },
+                modifier = Modifier.padding(top = 4.dp)
+            ) {
+                OutlinedTextField(
+                    value = selectedDevice?.let { "${it.name} (${it.address})" } ?: "Select a device",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Available devices (${devices.size})") },
+                    trailingIcon = {
+                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = deviceMenuExpanded)
+                    },
+                    modifier = Modifier
+                        .menuAnchor()
+                        .fillMaxWidth()
+                )
+                ExposedDropdownMenu(
+                    expanded = deviceMenuExpanded,
+                    onDismissRequest = { deviceMenuExpanded = false }
+                ) {
+                    devices.forEach { device ->
+                        DropdownMenuItem(
+                            text = { Text("${device.name} (${device.address})") },
+                            onClick = {
+                                selectedDeviceAddress = device.address
+                                deviceMenuExpanded = false
+                            }
+                        )
                     }
+                }
+            }
+            Button(
+                onClick = { selectedDevice?.let(onConnectDevice) },
+                enabled = selectedDevice != null,
+                modifier = Modifier.padding(top = 8.dp)
+            ) {
+                Text("Connect Selected Device")
+            }
+            LazyColumn(modifier = Modifier.height(80.dp)) {
+                items(devices, key = { it.address }) { device ->
+                    Text(
+                        text = "${device.name} • ${device.rssi} dBm",
+                        fontSize = 11.sp,
+                        color = if (device.address == selectedDeviceAddress) Amaranth else Color.Gray,
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
                 }
             }
         }
