@@ -3,6 +3,7 @@ package com.app.autohighlighttts
 import android.content.Context
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -18,6 +19,7 @@ class AutoHighlightTTSEngine {
      * Create Singleton Object
      */
     companion object {
+        private const val TAG = "AutoHighlightTTSEngine"
         private var instance: AutoHighlightTTSEngine? = null
         fun getInstance(): AutoHighlightTTSEngine {
             if (instance == null) {
@@ -45,6 +47,8 @@ class AutoHighlightTTSEngine {
     private var onDoneListener: (() -> Unit)? = null
     private var onErrorListener: ((String) -> Unit)? = null
     private var onHighlightListener: ((Pair<Int, Int>) -> Unit)? = null
+    private var onSpokenRangeListener: ((String?, Int, Int, Boolean) -> Unit)? = null
+    private var preferSentenceLevelSync: Boolean = true
 
 
     /**
@@ -133,9 +137,21 @@ class AutoHighlightTTSEngine {
             autoHighlightTTS.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     onEachSentenceStartListener?.invoke()
+                    val sentenceRange = getStartAndEndOfSubstring(
+                        mainText,
+                        listOfStringOfParagraph[currentCount.intValue].text
+                    )
+                    Log.d(TAG, "onStart utteranceId=$utteranceId sentenceStart=${sentenceRange.first} sentenceEnd=${sentenceRange.second}")
+                    onSpokenRangeListener?.invoke(
+                        utteranceId,
+                        sentenceRange.first,
+                        sentenceRange.second,
+                        false
+                    )
                 }
 
                 override fun onDone(utteranceId: String?) {
+                    Log.d(TAG, "onDone utteranceId=$utteranceId")
                     stopPosition = Pair(0, 0)
 
                     // If there are more sentences to speak
@@ -171,6 +187,7 @@ class AutoHighlightTTSEngine {
                 // Handle TTS errors
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
+                    Log.e(TAG, "onError utteranceId=$utteranceId")
                     onErrorListener?.invoke(utteranceId ?: "")
                 }
 
@@ -190,6 +207,10 @@ class AutoHighlightTTSEngine {
                     }
                     // Invoke the onHighlightListener
                     onHighlightListener?.invoke(Pair(start, end))
+                    Log.d(TAG, "onRangeStart utteranceId=$utteranceId start=$start end=$end")
+                    if (!preferSentenceLevelSync) {
+                        onSpokenRangeListener?.invoke(utteranceId, start, end, true)
+                    }
                 }
             })
         } else {
@@ -343,6 +364,23 @@ class AutoHighlightTTSEngine {
         return this
     }
 
+
+
+    /**
+     * [setOnSpokenRangeListener] emits spoken ranges for BLE sync.
+     */
+    fun setOnSpokenRangeListener(onSpokenRangeListener: (String?, Int, Int, Boolean) -> Unit): AutoHighlightTTSEngine {
+        this.onSpokenRangeListener = onSpokenRangeListener
+        return this
+    }
+
+    /**
+     * [setPreferSentenceLevelSync] keeps sentence-level sync as the safest default.
+     */
+    fun setPreferSentenceLevelSync(preferSentenceLevelSync: Boolean): AutoHighlightTTSEngine {
+        this.preferSentenceLevelSync = preferSentenceLevelSync
+        return this
+    }
 
     /**
      * @param pitch Speech pitch. 1.0 is the normal pitch, lower values lower the tone of
