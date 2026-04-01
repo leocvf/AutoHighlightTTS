@@ -38,6 +38,8 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
 
     init {
         initTTS(context)
+        ttsSyncBridge.setDocId("doc-default")
+        ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
     }
 
     private fun initTTS(context: Context): AutoHighlightTTSEngine {
