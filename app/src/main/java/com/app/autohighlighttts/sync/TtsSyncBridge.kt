@@ -15,7 +15,8 @@ import org.json.JSONObject
 class TtsSyncBridge(
     private val bleManager: BleManager,
     private var docId: String = "demo-001",
-    private val debounceMs: Long = 150L
+    private val debounceMs: Long = 150L,
+    private val sendPositionPackets: Boolean = true
 ) {
 
     companion object {
@@ -27,10 +28,10 @@ class TtsSyncBridge(
     private var pendingPosition: Pair<Int, Int>? = null
     private var positionJob: Job? = null
     private var lastPositionSentAt = 0L
-    private var activeChunks: List<TextChunk> = emptyList()
-    private var activeChunkIndex: Int = -1
+    private var activeSegments: List<TextSegment> = emptyList()
+    private var activeSegmentIndex: Int = -1
 
-    private data class TextChunk(
+    private data class TextSegment(
         val docId: String,
         val text: String,
         val startOffset: Int,
@@ -40,16 +41,16 @@ class TtsSyncBridge(
     fun sendPing() = sendPacket(JSONObject().put("type", "ping"))
 
     fun sendClear() {
-        activeChunks = emptyList()
-        activeChunkIndex = -1
+        activeSegments = emptyList()
+        activeSegmentIndex = -1
         sendPacket(JSONObject().put("type", "clear"))
     }
 
     fun setDocId(newDocId: String) {
         if (newDocId.isNotBlank()) {
             docId = newDocId
-            activeChunks = emptyList()
-            activeChunkIndex = -1
+            activeSegments = emptyList()
+            activeSegmentIndex = -1
         }
     }
 
@@ -58,14 +59,14 @@ class TtsSyncBridge(
             Log.w(TAG, "loadDocumentTextOnce ignored (blank text)")
             return false
         }
-        val chunks = buildLoadTextChunks(text)
-        if (chunks.isEmpty()) {
+        val segments = buildLoadTextSegments(text)
+        if (segments.isEmpty()) {
             Log.w(TAG, "loadDocumentTextOnce produced no chunks")
             return false
         }
-        activeChunks = chunks
-        activeChunkIndex = 0
-        return sendLoadTextChunk(activeChunkIndex)
+        activeSegments = segments
+        activeSegmentIndex = 0
+        return sendLoadTextSegment(activeSegmentIndex)
     }
 
     fun onSpokenRangeChanged(start: Int, end: Int) {
@@ -82,15 +83,20 @@ class TtsSyncBridge(
                 delay(debounceMs)
             }
 
-            val targetChunkIndex = findChunkIndex(range.first)
-            if (targetChunkIndex >= 0 && targetChunkIndex != activeChunkIndex) {
-                val switched = sendLoadTextChunk(targetChunkIndex)
+            val targetChunkIndex = findSegmentIndex(range.first)
+            if (targetChunkIndex >= 0 && targetChunkIndex != activeSegmentIndex) {
+                val switched = sendLoadTextSegment(targetChunkIndex)
                 if (!switched) {
                     Log.w(TAG, "Failed to switch chunk for position range=$range index=$targetChunkIndex")
                 }
             }
 
-            val activeChunk = activeChunks.getOrNull(activeChunkIndex)
+            if (!sendPositionPackets) {
+                lastPositionSentAt = SystemClock.elapsedRealtime()
+                return@launch
+            }
+
+            val activeChunk = activeSegments.getOrNull(activeSegmentIndex)
             val startOffset = activeChunk?.startOffset ?: 0
             val endOffset = activeChunk?.endOffsetExclusive ?: Int.MAX_VALUE
             val localStart = (range.first - startOffset).coerceAtLeast(0)
@@ -115,8 +121,8 @@ class TtsSyncBridge(
         Log.d(TAG, "outboundCommand sent=$sent payload=$packet")
     }
 
-    private fun sendLoadTextChunk(index: Int): Boolean {
-        val chunk = activeChunks.getOrNull(index) ?: return false
+    private fun sendLoadTextSegment(index: Int): Boolean {
+        val chunk = activeSegments.getOrNull(index) ?: return false
         val sent = bleManager.writeJson(
             JSONObject()
                 .put("type", "load_text")
@@ -124,47 +130,71 @@ class TtsSyncBridge(
                 .put("text", chunk.text)
         )
         if (sent) {
-            activeChunkIndex = index
+            activeSegmentIndex = index
         }
         return sent
     }
 
-    private fun findChunkIndex(globalOffset: Int): Int {
-        if (activeChunks.isEmpty()) return -1
-        return activeChunks.indexOfFirst { chunk ->
+    private fun findSegmentIndex(globalOffset: Int): Int {
+        if (activeSegments.isEmpty()) return -1
+        return activeSegments.indexOfFirst { chunk ->
             globalOffset >= chunk.startOffset && globalOffset < chunk.endOffsetExclusive
-        }.takeIf { it >= 0 } ?: (activeChunks.size - 1)
+        }.takeIf { it >= 0 } ?: (activeSegments.size - 1)
     }
 
-    private fun buildLoadTextChunks(text: String): List<TextChunk> {
+    private fun buildLoadTextSegments(text: String): List<TextSegment> {
+        val paragraphRanges = buildParagraphRanges(text)
         val maxPayloadBytes = 220
-        val chunks = mutableListOf<TextChunk>()
-        var start = 0
+        val chunks = mutableListOf<TextSegment>()
         var chunkIndex = 0
-        while (start < text.length) {
-            val chunkDocId = "$docId#$chunkIndex"
-            val end = findChunkEndIndex(text, start, maxPayloadBytes, chunkDocId)
-            if (end <= start) {
-                break
-            }
-            val candidate = text.substring(start, end)
-            chunks.add(
-                TextChunk(
-                    docId = chunkDocId,
-                    text = candidate,
-                    startOffset = start,
-                    endOffsetExclusive = end
+        paragraphRanges.forEach { range ->
+            var start = range.first
+            val paragraphEnd = range.second
+            while (start < paragraphEnd) {
+                val chunkDocId = "$docId#$chunkIndex"
+                val end = findChunkEndIndex(text, start, paragraphEnd, maxPayloadBytes, chunkDocId)
+                if (end <= start) {
+                    break
+                }
+                val candidate = text.substring(start, end)
+                chunks.add(
+                    TextSegment(
+                        docId = chunkDocId,
+                        text = candidate,
+                        startOffset = start,
+                        endOffsetExclusive = end
+                    )
                 )
-            )
-            start = end
-            chunkIndex++
+                start = end
+                chunkIndex++
+            }
         }
         return chunks
     }
 
-    private fun findChunkEndIndex(text: String, start: Int, maxPayloadBytes: Int, chunkDocId: String): Int {
+    private fun buildParagraphRanges(text: String): List<Pair<Int, Int>> {
+        val ranges = mutableListOf<Pair<Int, Int>>()
+        var start = 0
+        while (start < text.length) {
+            val paragraphBreak = text.indexOf("\n\n", start)
+            val end = if (paragraphBreak >= 0) paragraphBreak + 2 else text.length
+            if (end > start) {
+                ranges.add(start to end)
+            }
+            start = end
+        }
+        return ranges
+    }
+
+    private fun findChunkEndIndex(
+        text: String,
+        start: Int,
+        maxEnd: Int,
+        maxPayloadBytes: Int,
+        chunkDocId: String
+    ): Int {
         var low = start + 1
-        var high = text.length
+        var high = maxEnd
         var best = -1
 
         while (low <= high) {

@@ -12,9 +12,9 @@ This app includes an MVP BLE client that sends Remote TTS JSON commands to Cross
   - `{"type":"position","docId":"demo-001","start":N,"end":M}`
 - Supports write queue + reconnect attempts.
 - Splits large payloads into MTU-aware chunks.
-- For large documents, the app sends MTU-safe `load_text` chunks and keeps `position`
-  updates aligned to the active chunk (so each BLE write is valid JSON for firmware parsing).
-- Debounces position updates (~150ms) to avoid flooding.
+- For large documents, the app sends paragraph-scoped MTU-safe `load_text` chunks.
+- During live narration sync, the app switches paragraphs by sending `load_text` for the
+  active paragraph/chunk and does not send `position` updates (default behavior).
 - Logs BLE lifecycle + every outbound command.
 
 ## CrossPoint enhanced-reading-mod compatibility
@@ -60,7 +60,7 @@ All packets are UTF-8 JSON written to the command characteristic:
 5. Tap **Send Ping** and confirm X4 serial log receives ping JSON.
 6. Tap **Send Clear** and confirm clear command appears in X4 logs.
 7. Tap **Load Sample Text** and verify `load_text` arrives (possibly chunked).
-8. Move slider; confirm `position` updates arrive at debounced cadence.
+8. Move slider; confirm active paragraph/chunk is re-sent with `load_text` updates.
 9. Tap **Disconnect** and confirm disconnection logs on both Android/X4 sides.
 
 ## Notes
