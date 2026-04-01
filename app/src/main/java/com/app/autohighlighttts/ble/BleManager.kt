@@ -206,8 +206,8 @@ class BleManager(private val context: Context) {
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "onScanFailed errorCode=$errorCode")
             _connectionState.value = "SCAN_FAILED_$errorCode"
-            val detail = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && errorCode == BluetoothStatusCodes.ERROR_MISSING_BLUETOOTH_SCAN_PERMISSION) {
-                "Scan failed due to missing BLUETOOTH_SCAN permission"
+            val detail = if (!hasRequiredPermissions()) {
+                "Scan failed due to missing required Bluetooth permissions"
             } else {
                 "Scan failed with code=$errorCode"
             }
@@ -334,20 +334,16 @@ class BleManager(private val context: Context) {
         _connectionState.value = "CONNECTING"
         _statusDetail.value = "Connecting to ${device.address} (${device.name ?: "unknown"})"
         bluetoothGatt?.close()
-        bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, false, gattCallback)
-        }
+        bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         Log.d(TAG, "connect to ${device.address}")
     }
 
-    @SuppressLint("MissingPermission", "DEPRECATION")
+    @SuppressLint("MissingPermission")
     fun writeJson(json: JSONObject): Boolean {
         return queuePayload(json.toString().toByteArray(Charsets.UTF_8), json.toString())
     }
 
-    @SuppressLint("MissingPermission", "DEPRECATION")
+    @SuppressLint("MissingPermission")
     private fun queuePayload(payload: ByteArray, rawMessage: String): Boolean {
         val gatt = bluetoothGatt
         val characteristic = commandCharacteristic
@@ -371,7 +367,7 @@ class BleManager(private val context: Context) {
         return true
     }
 
-    @SuppressLint("MissingPermission", "DEPRECATION")
+    @SuppressLint("MissingPermission")
     private fun flushNextWrite() {
         if (isOperationInFlight) return
 
@@ -392,8 +388,7 @@ class BleManager(private val context: Context) {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
 
-        characteristic.value = nextChunk
-        val ok = gatt.writeCharacteristic(characteristic)
+        val ok = gatt.writeCharacteristic(characteristic, nextChunk, characteristic.writeType) == BluetoothStatusCodes.SUCCESS
         Log.d(
             TAG,
             "flushNextWrite ok=$ok bytes=${nextChunk.size} writeType=${characteristic.writeType} queueRemaining=${writeQueue.size}"
