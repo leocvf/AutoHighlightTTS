@@ -72,6 +72,8 @@ class TtsSyncBridge(
     private var lastPositionSentAt = 0L
     private var sourceDocumentText: String = ""
     private var lastHighlightedPayload: String? = null
+    private var legacyChunks: List<LegacyChunk> = emptyList()
+    private var activeLegacyChunkIndex: Int = -1
 
     private var session: StreamSession? = null
     private var ackModeEnabled: Boolean = false
@@ -107,6 +109,12 @@ class TtsSyncBridge(
         val chunk: StreamChunk,
         var lastSentAtMs: Long,
         var retryCount: Int
+    )
+
+    private data class LegacyChunk(
+        val startOffset: Int,
+        val endOffsetExclusive: Int,
+        val text: String
     )
 
     internal data class StreamMetrics(
@@ -154,7 +162,7 @@ class TtsSyncBridge(
         lastHighlightedPayload = null
 
         if (!streamingEnabled) {
-            return buildFallbackSegments(text).isNotEmpty()
+            return buildLegacyChunks(text).isNotEmpty()
         }
 
         val maxJsonBytes = (transport.maxPayloadBytes() - 8).coerceAtLeast(90)
@@ -409,25 +417,81 @@ class TtsSyncBridge(
     }
 
     private fun sendFallbackPosition(start: Int, end: Int) {
+        val chunk = ensureLegacyChunkForOffset(start)
+        val localStart = if (chunk != null) {
+            (start - chunk.startOffset).coerceIn(0, chunk.text.length)
+        } else {
+            start
+        }
+        val localEnd = if (chunk != null) {
+            (end - chunk.startOffset).coerceIn(localStart, chunk.text.length)
+        } else {
+            end.coerceAtLeast(localStart)
+        }
         val packet = JSONObject()
             .put("type", "position")
             .put("docId", docId)
-            .put("start", start)
-            .put("end", end)
+            .put("start", localStart)
+            .put("end", localEnd)
         enqueuePacket(packet)
     }
 
-    private fun buildFallbackSegments(text: String): List<String> {
-        val segments = text.split("\n\n").filter { it.isNotBlank() }
-        if (segments.isNotEmpty()) {
+    private fun buildLegacyChunks(text: String): List<LegacyChunk> {
+        if (text.isBlank()) return emptyList()
+        val maxJsonBytes = (transport.maxPayloadBytes() - 8).coerceAtLeast(90)
+        val chunks = buildLegacyChunkRanges(text, maxJsonBytes)
+        legacyChunks = chunks
+        activeLegacyChunkIndex = -1
+        ensureLegacyChunkForOffset(0)
+        return chunks
+    }
+
+    private fun buildLegacyChunkRanges(text: String, maxJsonBytes: Int): List<LegacyChunk> {
+        val ranges = mutableListOf<LegacyChunk>()
+        var cursor = 0
+        while (cursor < text.length) {
+            var probeEnd = (cursor + 420).coerceAtMost(text.length)
+            var accepted = -1
+            while (probeEnd > cursor) {
+                val candidate = text.substring(cursor, probeEnd)
+                if (fitsLegacyLoadTextPayload(candidate, maxJsonBytes)) {
+                    accepted = probeEnd
+                    break
+                }
+                probeEnd--
+            }
+            if (accepted <= cursor) {
+                break
+            }
+            val boundary = preferredBoundary(text, cursor, accepted)
+            val resolvedBoundary = boundary.coerceAtLeast(cursor + 1)
+            ranges += LegacyChunk(
+                startOffset = cursor,
+                endOffsetExclusive = resolvedBoundary,
+                text = text.substring(cursor, resolvedBoundary)
+            )
+            cursor = resolvedBoundary
+        }
+        return ranges
+    }
+
+    private fun ensureLegacyChunkForOffset(globalOffset: Int): LegacyChunk? {
+        if (legacyChunks.isEmpty()) return null
+        val targetIndex = legacyChunks.indexOfFirst {
+            globalOffset in it.startOffset until it.endOffsetExclusive
+        }.takeIf { it >= 0 } ?: legacyChunks.lastIndex
+
+        if (targetIndex != activeLegacyChunkIndex) {
+            val chunk = legacyChunks[targetIndex]
             enqueuePacket(
                 JSONObject()
                     .put("type", "load_text")
                     .put("docId", docId)
-                    .put("text", segments.first())
+                    .put("text", chunk.text)
             )
+            activeLegacyChunkIndex = targetIndex
         }
-        return segments
+        return legacyChunks.getOrNull(activeLegacyChunkIndex)
     }
 
     private fun sendHighlightedRangeAsLoadText(start: Int, end: Int) {
@@ -446,7 +510,7 @@ class TtsSyncBridge(
         enqueuePacket(
             JSONObject()
                 .put("type", "load_text")
-                .put("docId", "$docId#live")
+                .put("docId", docId)
                 .put("text", highlightedText)
         )
         lastHighlightedPayload = payloadKey
@@ -456,6 +520,8 @@ class TtsSyncBridge(
         sendStreamEnd()
         session = null
         sourceDocumentText = ""
+        legacyChunks = emptyList()
+        activeLegacyChunkIndex = -1
         outboundQueue.clear()
         ackWaiting.clear()
         sentChunkSeqs.clear()
@@ -579,6 +645,14 @@ class TtsSyncBridge(
             .put("start", 0)
             .put("end", chunkText.length)
             .put("checksum", chunkText.hashCode())
+            .put("text", chunkText)
+        return probe.toString().toByteArray(Charsets.UTF_8).size <= maxJsonBytes
+    }
+
+    private fun fitsLegacyLoadTextPayload(chunkText: String, maxJsonBytes: Int): Boolean {
+        val probe = JSONObject()
+            .put("type", "load_text")
+            .put("docId", "d")
             .put("text", chunkText)
         return probe.toString().toByteArray(Charsets.UTF_8).size <= maxJsonBytes
     }
