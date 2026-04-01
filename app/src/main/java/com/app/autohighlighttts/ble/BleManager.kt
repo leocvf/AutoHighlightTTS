@@ -363,7 +363,8 @@ class BleManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun writeJson(json: JSONObject): Boolean {
-        return queuePayload(json.toString().toByteArray(Charsets.UTF_8), json.toString())
+        val raw = json.toString()
+        return queuePayload(raw.toByteArray(Charsets.UTF_8), raw)
     }
 
     @SuppressLint("MissingPermission")
@@ -377,10 +378,16 @@ class BleManager(private val context: Context) {
         }
 
         val maxChunkBytes = (currentMtu - ATT_WRITE_OVERHEAD).coerceAtLeast(20)
-        payload.asList()
-            .chunked(maxChunkBytes)
-            .map { it.toByteArray() }
-            .forEach { chunk -> writeQueue.add(chunk) }
+        if (payload.size > maxChunkBytes) {
+            Log.w(
+                TAG,
+                "queuePayload rejected: payloadBytes=${payload.size} exceeds maxChunkBytes=$maxChunkBytes raw=$rawMessage"
+            )
+            _statusDetail.value = "Write rejected: payload too large for current MTU ($maxChunkBytes bytes max)"
+            return false
+        }
+
+        writeQueue.add(payload)
 
         Log.d(
             TAG,

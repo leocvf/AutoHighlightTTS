@@ -35,6 +35,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
@@ -154,6 +155,7 @@ fun TTSScreen(
         var selectedVoice by remember { mutableStateOf<String?>(null) }
         var engines by remember { mutableStateOf(viewModel.availableEngines()) }
         var voices by remember { mutableStateOf(viewModel.availableVoices()) }
+        var showConfigurationScreen by remember { mutableStateOf(false) }
         val epubPickerLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocument()
         ) { uri ->
@@ -175,52 +177,67 @@ fun TTSScreen(
                 .background(Color.White)
                 .padding(horizontal = 20.dp)
         ) {
-
-            Text(
-                text = stringResource(id = R.string.text_to_speech),
-                color = Amaranth,
-                fontWeight = FontWeight.Medium,
-                fontSize = 30.sp,
-                fontFamily = fontFamily,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 50.dp, bottom = 20.dp),
-                textAlign = TextAlign.Center
-            )
-            OutlinedTextField(
-                value = editableText,
-                onValueChange = { editableText = it },
-                label = { Text("Text to read") },
-                modifier = Modifier.fillMaxWidth()
-            )
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    .padding(top = 40.dp, bottom = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(
-                    onClick = { viewModel.updateNarrationText(editableText) },
-                    modifier = Modifier.weight(1f)
-                ) { Text("Apply Text") }
-                Button(
-                    onClick = { viewModel.loadSampleText() },
-                    modifier = Modifier.weight(1f)
-                ) { Text("Sync to Device") }
+                Text(
+                    text = stringResource(id = R.string.text_to_speech),
+                    color = Amaranth,
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 30.sp,
+                    fontFamily = fontFamily,
+                    textAlign = TextAlign.Start
+                )
+                TextButton(onClick = { showConfigurationScreen = !showConfigurationScreen }) {
+                    Text(if (showConfigurationScreen) "Back to Reader" else "Configuration")
+                }
             }
-            Button(
-                onClick = { epubPickerLauncher.launch(arrayOf("application/epub+zip")) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp)
-            ) {
-                Text("Load EPUB")
-            }
-            ExposedDropdownMenuBox(
-                expanded = engineMenuExpanded,
-                onExpandedChange = { engineMenuExpanded = !engineMenuExpanded },
-                modifier = Modifier.padding(top = 8.dp)
-            ) {
+
+            if (showConfigurationScreen) {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    item {
+                        OutlinedTextField(
+                            value = editableText,
+                            onValueChange = { editableText = it },
+                            label = { Text("Text to read") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = { viewModel.updateNarrationText(editableText) },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("Apply Text") }
+                            Button(
+                                onClick = { viewModel.loadSampleText() },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("Sync to Device") }
+                        }
+                    }
+                    item {
+                        Button(
+                            onClick = { epubPickerLauncher.launch(arrayOf("application/epub+zip")) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Load EPUB")
+                        }
+                    }
+                    item {
+                        ExposedDropdownMenuBox(
+                            expanded = engineMenuExpanded,
+                            onExpandedChange = { engineMenuExpanded = !engineMenuExpanded }
+                        ) {
                 OutlinedTextField(
                     value = selectedEngine ?: "Select TTS engine",
                     onValueChange = {},
@@ -247,11 +264,12 @@ fun TTSScreen(
                         )
                     }
                 }
-            }
-            ExposedDropdownMenuBox(
+                        }
+                    }
+                    item {
+                        ExposedDropdownMenuBox(
                 expanded = voiceMenuExpanded,
                 onExpandedChange = { voiceMenuExpanded = !voiceMenuExpanded },
-                modifier = Modifier.padding(top = 8.dp)
             ) {
                 OutlinedTextField(
                     value = selectedVoice ?: "Select voice",
@@ -276,11 +294,12 @@ fun TTSScreen(
                         )
                     }
                 }
-            }
-            ExposedDropdownMenuBox(
+                        }
+                    }
+                    item {
+                        ExposedDropdownMenuBox(
                 expanded = alignmentMenuExpanded,
                 onExpandedChange = { alignmentMenuExpanded = !alignmentMenuExpanded },
-                modifier = Modifier.padding(top = 8.dp)
             ) {
                 OutlinedTextField(
                     value = textAlign.toDisplayName(),
@@ -303,41 +322,46 @@ fun TTSScreen(
                         )
                     }
                 }
-            }
-            Text(text = "Text Size: ${fontSize.roundToInt()}sp", modifier = Modifier.padding(top = 8.dp))
-            Slider(
-                value = fontSize,
-                valueRange = 14f..36f,
-                onValueChange = { fontSize = it }
-            )
-            Text(
-                text = "Voice Pitch: ${"%.1f".format(pitch)}",
-                modifier = Modifier.padding(top = 8.dp)
-            )
-            Slider(
-                value = pitch,
-                valueRange = 0.5f..2f,
-                onValueChange = {
-                    pitch = it
-                    viewModel.updatePitchAndSpeed(pitch, speed)
+                        }
+                    }
+                    item { Text(text = "Text Size: ${fontSize.roundToInt()}sp") }
+                    item {
+                        Slider(
+                            value = fontSize,
+                            valueRange = 14f..36f,
+                            onValueChange = { fontSize = it }
+                        )
+                    }
+                    item { Text(text = "Voice Pitch: ${"%.1f".format(pitch)}") }
+                    item {
+                        Slider(
+                            value = pitch,
+                            valueRange = 0.5f..2f,
+                            onValueChange = {
+                                pitch = it
+                                viewModel.updatePitchAndSpeed(pitch, speed)
+                            }
+                        )
+                    }
+                    item { Text(text = "Voice Speed: ${"%.1f".format(speed)}") }
+                    item {
+                        Slider(
+                            value = speed,
+                            valueRange = 0.5f..2f,
+                            onValueChange = {
+                                speed = it
+                                viewModel.updatePitchAndSpeed(pitch, speed)
+                            }
+                        )
+                    }
                 }
-            )
-            Text(text = "Voice Speed: ${"%.1f".format(speed)}")
-            Slider(
-                value = speed,
-                valueRange = 0.5f..2f,
-                onValueChange = {
-                    speed = it
-                    viewModel.updatePitchAndSpeed(pitch, speed)
-                }
-            )
-
-            Box(
-                Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(end = 10.dp)
-            ) {
+            } else {
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(end = 10.dp)
+                ) {
                 AutoHighlightTTSComposable(
                     tts = tts,
                     textAlign = textAlign,
@@ -357,28 +381,28 @@ fun TTSScreen(
                         lineHeight = 35.sp
                     ),
                 )
+                }
+                BleTestPanel(
+                    connectionState = connectionState,
+                    statusDetail = bleStatusDetail,
+                    onConnect = {
+                        if (viewModel.hasRequiredBlePermissions()) {
+                            viewModel.scanBleDevices(includeAllDevices = true)
+                        } else {
+                            pendingBleScanAfterPermission = true
+                            permissionLauncher.launch(viewModel.requiredBlePermissions())
+                        }
+                    },
+                    devices = scannedDevices,
+                    onConnectDevice = viewModel::connectBle,
+                    onDisconnect = viewModel::disconnectBle,
+                    onPing = viewModel::sendPing,
+                    onClear = viewModel::sendClear,
+                    onLoadSample = viewModel::loadSampleText,
+                    onPosition = viewModel::sendPosition
+                )
+                Spacer(modifier = Modifier.height(8.dp))
             }
-            Spacer(modifier = Modifier.height(20.dp))
-            BleTestPanel(
-                connectionState = connectionState,
-                statusDetail = bleStatusDetail,
-                onConnect = {
-                    if (viewModel.hasRequiredBlePermissions()) {
-                        viewModel.scanBleDevices(includeAllDevices = true)
-                    } else {
-                        pendingBleScanAfterPermission = true
-                        permissionLauncher.launch(viewModel.requiredBlePermissions())
-                    }
-                },
-                devices = scannedDevices,
-                onConnectDevice = viewModel::connectBle,
-                onDisconnect = viewModel::disconnectBle,
-                onPing = viewModel::sendPing,
-                onClear = viewModel::sendClear,
-                onLoadSample = viewModel::loadSampleText,
-                onPosition = viewModel::sendPosition
-            )
-            Spacer(modifier = Modifier.height(16.dp))
             BottomStorySection(tts)
         }
     } ?: Box(contentAlignment = Alignment.Center) {
