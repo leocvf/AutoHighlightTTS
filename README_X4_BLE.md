@@ -1,34 +1,38 @@
-# X4 BLE + TTS Sync (MVP) — Phase 2/3 + Phase 4 Hook
+# X4 BLE Remote TTS MVP (Android)
 
-## What was added
-- BLE transport layer (`BleManager`) for scan/connect/discover/write JSON.
-- UUID placeholder constants in one file (`X4BleUuids`).
-- TTS sync packet builder (`TtsSyncBridge`) for `ping`, `load_text`, and debounced `position` packets.
-- Phase 4 hook in `AutoHighlightTTSEngine` + `AutoHighlightTTSViewModel`:
-  - emits sentence-level spoken range on `onStart` (safe default)
-  - logs `onRangeStart` and only emits range-level events when sentence-preferred mode is disabled
+This app includes an MVP BLE client that sends Remote TTS JSON commands to CrossPoint X4.
 
-## Safest fallback path
-- `setPreferSentenceLevelSync(true)` is used by default.
-- This means sentence-level sync is always emitted and range-level callbacks are treated as optional diagnostics unless explicitly enabled.
+## Implemented behavior
+- Scans and connects to a peripheral advertising the placeholder X4 service UUID.
+- Discovers writable command characteristic.
+- Sends UTF-8 JSON commands:
+  - `{"type":"ping"}`
+  - `{"type":"clear"}`
+  - `{"type":"load_text","docId":"demo-001","text":"..."}`
+  - `{"type":"position","docId":"demo-001","start":N,"end":M}`
+- Supports write queue + reconnect attempts.
+- Splits large payloads into MTU-aware chunks.
+- Debounces position updates (~150ms) to avoid flooding.
+- Logs BLE lifecycle + every outbound command.
 
-## File list
-- `app/src/main/java/com/app/autohighlighttts/ble/X4BleUuids.kt`
-- `app/src/main/java/com/app/autohighlighttts/ble/BleManager.kt`
-- `app/src/main/java/com/app/autohighlighttts/sync/TtsSyncBridge.kt`
-- `app/src/main/AndroidManifest.xml`
-- `AutoHighlightTTS/src/main/java/com/app/autohighlighttts/AutoHighlightTTSEngine.kt`
-- `app/src/main/java/com/app/autohighlighttts/AutoHighlightTTSViewModel.kt`
+## UUID placeholders
+Defined in `app/src/main/java/com/app/autohighlighttts/ble/X4BleUuids.kt`.
 
-## BLE UUID placeholders to replace
-- `X4_SERVICE_UUID`
-- `X4_COMMAND_CHARACTERISTIC_UUID`
+> TODO: replace placeholder UUIDs with real CrossPoint X4 service/characteristic UUIDs.
 
-## Android permission choices
-- `BLUETOOTH` + `BLUETOOTH_ADMIN` (with `maxSdkVersion=30`) for legacy BLE behavior.
-- `ACCESS_FINE_LOCATION` (with `maxSdkVersion=30`) for scan visibility on pre-Android 12.
-- `BLUETOOTH_SCAN` + `BLUETOOTH_CONNECT` for Android 12+ runtime permission model.
+## Test steps (with X4 serial logs)
+1. Flash/run X4 firmware with BLE Remote TTS bridge enabled.
+2. Open serial monitor for X4 logs.
+3. Launch Android app and grant Bluetooth permissions.
+4. In **BLE Test Panel**:
+   - Tap **Connect**.
+   - Wait until state becomes `READY`.
+5. Tap **Send Ping** and confirm X4 serial log receives ping JSON.
+6. Tap **Send Clear** and confirm clear command appears in X4 logs.
+7. Tap **Load Sample Text** and verify `load_text` arrives (possibly chunked).
+8. Move slider; confirm `position` updates arrive at debounced cadence.
+9. Tap **Disconnect** and confirm disconnection logs on both Android/X4 sides.
 
-## Current limitations
-- No BLE control UI in this phase; transport and sync hooks are in code-level wiring.
-- Firmware UUID/protocol values are placeholders until provided by X4 firmware bridge.
+## Notes
+- Minimum Android API is 26.
+- For Android 12+, `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` runtime permissions are required.

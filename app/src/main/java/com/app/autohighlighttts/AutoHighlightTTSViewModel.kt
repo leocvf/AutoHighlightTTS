@@ -7,6 +7,7 @@ import com.app.autohighlighttts.ble.BleManager
 import com.app.autohighlighttts.sync.TtsSyncBridge
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.StateFlow
 import java.util.Locale
 import javax.inject.Inject
 import com.app.autohighlightttssample.R
@@ -20,9 +21,10 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
 
     lateinit var instanceOfTTS: AutoHighlightTTSEngine
 
-    // Phase 4 hook wiring; UI controls can be added in later phases.
     private val bleManager = BleManager(context)
     private val ttsSyncBridge = TtsSyncBridge(bleManager)
+
+    val connectionState: StateFlow<String> = bleManager.connectionState
 
     init {
         initTTS(context)
@@ -46,7 +48,28 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
         return instanceOfTTS
     }
 
+    fun requiredBlePermissions(): Array<String> = bleManager.requiredPermissions()
+
+    fun hasRequiredBlePermissions(): Boolean = bleManager.hasRequiredPermissions()
+
+    fun connectBle() = bleManager.scanAndConnect()
+
+    fun disconnectBle() = bleManager.disconnect()
+
+    fun sendPing() = ttsSyncBridge.sendPing()
+
+    fun sendClear() = ttsSyncBridge.sendClear()
+
+    fun loadSampleText() {
+        ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
+    }
+
+    fun sendPosition(start: Int, end: Int) {
+        ttsSyncBridge.onSpokenRangeChanged(start, end)
+    }
+
     override fun onCleared() {
+        ttsSyncBridge.close()
         bleManager.disconnect()
         super.onCleared()
     }
