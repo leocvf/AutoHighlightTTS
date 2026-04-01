@@ -173,6 +173,7 @@ It would be great for us if the reporter can share the below things to understan
 
 * minSdkVersion >= 24
 * Androidx
+* JDK 21 (recommended for Gradle/AGP compatibility; newer JDKs such as 25 may fail during Gradle Kotlin script parsing)
 
 # LICENSE!
 
