@@ -104,9 +104,24 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
         val connectionState by viewModel.connectionState.collectAsState()
         val bleStatusDetail by viewModel.bleStatusDetail.collectAsState()
         val scannedDevices by viewModel.scannedDevices.collectAsState()
+        var pendingBleScanAfterPermission by remember { mutableStateOf(false) }
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions()
-        ) { _ -> }
+        ) { granted ->
+            val allGranted = granted.values.all { it }
+            if (pendingBleScanAfterPermission && allGranted) {
+                viewModel.scanBleDevices(includeAllDevices = true)
+            } else if (pendingBleScanAfterPermission && !allGranted) {
+                scope.launch {
+                    Toast.makeText(
+                        context,
+                        "Bluetooth permissions are required to scan devices.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            pendingBleScanAfterPermission = false
+        }
 
         tts.setOnCompletionListener {
             Log.e("TAG", "TTSScreen: Completed From Callback")
@@ -174,6 +189,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
                     if (viewModel.hasRequiredBlePermissions()) {
                         viewModel.scanBleDevices(includeAllDevices = true)
                     } else {
+                        pendingBleScanAfterPermission = true
                         permissionLauncher.launch(viewModel.requiredBlePermissions())
                     }
                 },
