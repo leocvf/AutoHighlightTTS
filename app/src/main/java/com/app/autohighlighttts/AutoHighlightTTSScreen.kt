@@ -34,6 +34,7 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -111,6 +112,7 @@ fun TTSScreen(
         val connectionState by viewModel.connectionState.collectAsState()
         val bleStatusDetail by viewModel.bleStatusDetail.collectAsState()
         val scannedDevices by viewModel.scannedDevices.collectAsState()
+        val streamingModeEnabled by viewModel.streamingModeEnabled.collectAsState()
         var pendingBleScanAfterPermission by remember { mutableStateOf(false) }
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -209,6 +211,30 @@ fun TTSScreen(
                             label = { Text("Text to read") },
                             modifier = Modifier.fillMaxWidth()
                         )
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Streaming protocol (non-legacy)")
+                                Text(
+                                    text = if (streamingModeEnabled) {
+                                        "Using stream_start/stream_chunk/stream_commit"
+                                    } else {
+                                        "Using legacy load_text/position mode"
+                                    },
+                                    fontSize = 12.sp,
+                                    color = Color.Gray
+                                )
+                            }
+                            Switch(
+                                checked = streamingModeEnabled,
+                                onCheckedChange = viewModel::setStreamingModeEnabled
+                            )
+                        }
                     }
                     item {
                         Row(

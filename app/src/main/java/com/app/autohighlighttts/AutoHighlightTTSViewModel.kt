@@ -11,7 +11,9 @@ import com.app.autohighlighttts.ble.BleManager.ScannedDevice
 import com.app.autohighlighttts.sync.TtsSyncBridge
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.Locale
 import javax.inject.Inject
 import com.app.autohighlightttssample.R
@@ -27,14 +29,10 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     private val appContext: Context = context
 
     private val bleManager = BleManager(context)
-    private val ttsSyncBridge = TtsSyncBridge(
-        bleManager = bleManager,
-        // crosspoint-enhanced-reading-mod (leocvf fork) currently documents
-        // load_text + position as the supported remote-reader protocol.
-        // Keep streaming disabled for interoperability with that firmware branch.
-        sendPositionPackets = true,
-        streamingEnabled = false
-    )
+    private val _streamingModeEnabled = MutableStateFlow(false)
+    val streamingModeEnabled: StateFlow<Boolean> = _streamingModeEnabled.asStateFlow()
+    private var currentDocId: String = "doc-default"
+    private var ttsSyncBridge: TtsSyncBridge = createSyncBridge(_streamingModeEnabled.value)
 
     val connectionState: StateFlow<String> = bleManager.connectionState
     val bleStatusDetail: StateFlow<String> = bleManager.statusDetail
@@ -55,7 +53,27 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
             }
         }
         initTTS(context)
-        ttsSyncBridge.setDocId("doc-default")
+        ttsSyncBridge.setDocId(currentDocId)
+        ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
+    }
+
+    private fun createSyncBridge(streamingEnabled: Boolean): TtsSyncBridge {
+        return TtsSyncBridge(
+            bleManager = bleManager,
+            sendPositionPackets = true,
+            streamingEnabled = streamingEnabled
+        )
+    }
+
+    fun setStreamingModeEnabled(enabled: Boolean) {
+        if (_streamingModeEnabled.value == enabled) return
+
+        ttsSyncBridge.sendClear()
+        ttsSyncBridge.close()
+        _streamingModeEnabled.value = enabled
+        ttsSyncBridge = createSyncBridge(enabled)
+        ttsSyncBridge.setAckModeEnabled(true)
+        ttsSyncBridge.setDocId(currentDocId)
         ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
     }
 
@@ -100,7 +118,8 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     }
 
     fun updateNarrationText(text: String) {
-        ttsSyncBridge.setDocId("doc-${text.hashCode()}")
+        currentDocId = "doc-${text.hashCode()}"
+        ttsSyncBridge.setDocId(currentDocId)
         instanceOfTTS.setText(text)
         ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
     }
@@ -122,7 +141,8 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     }
 
     fun loadEpub(uri: Uri): String {
-        ttsSyncBridge.setDocId(uri.lastPathSegment?.substringAfterLast('/') ?: "epub-${System.currentTimeMillis()}")
+        currentDocId = uri.lastPathSegment?.substringAfterLast('/') ?: "epub-${System.currentTimeMillis()}"
+        ttsSyncBridge.setDocId(currentDocId)
         val text = EpubParser.readText(appContext, uri)
         if (text.isNotBlank()) {
             updateNarrationText(text)
