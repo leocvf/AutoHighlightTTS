@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothStatusCodes
@@ -28,7 +29,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 import java.util.ArrayDeque
+import java.util.HashMap
 import java.util.UUID
+import kotlin.math.roundToInt
 
 class BleManager(private val context: Context) {
 
@@ -58,6 +61,7 @@ class BleManager(private val context: Context) {
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var commandCharacteristic: BluetoothGattCharacteristic? = null
+    private var feedbackCharacteristic: BluetoothGattCharacteristic? = null
     private var commandServiceUuid: UUID? = null
     private var lastConnectedDevice: BluetoothDevice? = null
     private var reconnectAttempts = 0
@@ -65,6 +69,9 @@ class BleManager(private val context: Context) {
 
     private var isOperationInFlight = false
     private val writeQueue = ArrayDeque<ByteArray>()
+    private val writeStartedAtMs = HashMap<Int, Long>()
+    private var avgWriteLatencyMs: Double = 0.0
+    private var writeCount: Long = 0
 
     private val scanner get() = bluetoothAdapter?.bluetoothLeScanner
 
@@ -80,6 +87,7 @@ class BleManager(private val context: Context) {
     private var discoveredCount: Int = 0
     private var serviceFilterEnabled: Boolean = true
     private var continuousScanEnabled: Boolean = false
+    var onFeedbackPacket: ((JSONObject) -> Unit)? = null
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
@@ -102,6 +110,7 @@ class BleManager(private val context: Context) {
                 else -> {
                     _connectionState.value = "DISCONNECTED"
                     commandCharacteristic = null
+                    feedbackCharacteristic = null
                     commandServiceUuid = null
                     isOperationInFlight = false
                     writeQueue.clear()
@@ -131,6 +140,9 @@ class BleManager(private val context: Context) {
             val (service, characteristic, selectedByFallback) = resolveCommandTarget(gatt.services)
             commandServiceUuid = service?.uuid
             commandCharacteristic = characteristic
+            feedbackCharacteristic = service
+                ?.characteristics
+                ?.firstOrNull { it.uuid == X4BleUuids.X4_FEEDBACK_CHARACTERISTIC_UUID }
 
             if (commandCharacteristic != null) {
                 _connectionState.value = "READY"
@@ -148,6 +160,7 @@ class BleManager(private val context: Context) {
                 TAG,
                 "commandCharacteristicFound=${commandCharacteristic != null} service=$commandServiceUuid characteristic=${commandCharacteristic?.uuid} fallback=$selectedByFallback"
             )
+            feedbackCharacteristic?.let { enableFeedbackNotifications(gatt, it) }
         }
 
         @SuppressLint("MissingPermission")
@@ -156,11 +169,68 @@ class BleManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            val now = System.currentTimeMillis()
+            val started = writeStartedAtMs.remove(characteristic.hashCode())
+            if (started != null) {
+                val latency = (now - started).coerceAtLeast(0)
+                writeCount += 1
+                val alpha = 0.2
+                avgWriteLatencyMs = if (writeCount == 1L) {
+                    latency.toDouble()
+                } else {
+                    (1 - alpha) * avgWriteLatencyMs + alpha * latency
+                }
+            }
             Log.d(TAG, "onCharacteristicWrite uuid=${characteristic.uuid} status=$status")
             _statusDetail.value = "Last write status=$status queueRemaining=${writeQueue.size}"
             isOperationInFlight = false
             flushNextWrite()
         }
+
+        @SuppressLint("MissingPermission")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid != X4BleUuids.X4_FEEDBACK_CHARACTERISTIC_UUID) return
+            handleFeedbackBytes(value)
+        }
+
+        @Suppress("DEPRECATION")
+        @SuppressLint("MissingPermission")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            if (characteristic.uuid != X4BleUuids.X4_FEEDBACK_CHARACTERISTIC_UUID) return
+            handleFeedbackBytes(characteristic.value ?: return)
+        }
+    }
+
+    private fun handleFeedbackBytes(payload: ByteArray) {
+        val raw = payload.toString(Charsets.UTF_8)
+        runCatching { JSONObject(raw) }
+            .onSuccess { packet ->
+                Log.d(TAG, "feedbackPacket=$packet")
+                onFeedbackPacket?.invoke(packet)
+            }
+            .onFailure {
+                Log.w(TAG, "Ignoring malformed feedback payload='$raw'")
+            }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enableFeedbackNotifications(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ) {
+        val notifyEnabled = gatt.setCharacteristicNotification(characteristic, true)
+        Log.d(TAG, "enableFeedbackNotifications notifyEnabled=$notifyEnabled")
+        val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        val descriptor = characteristic.getDescriptor(cccdUuid) ?: return
+        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        gatt.writeDescriptor(descriptor)
     }
 
     private fun resolveCommandTarget(services: List<BluetoothGattService>): Triple<BluetoothGattService?, BluetoothGattCharacteristic?, Boolean> {
@@ -367,6 +437,12 @@ class BleManager(private val context: Context) {
         return queuePayload(raw.toByteArray(Charsets.UTF_8), raw)
     }
 
+    fun maxPayloadBytes(): Int = (currentMtu - ATT_WRITE_OVERHEAD).coerceAtLeast(20)
+
+    fun pendingWriteCount(): Int = writeQueue.size + if (isOperationInFlight) 1 else 0
+
+    fun meanWriteLatencyMs(): Int = avgWriteLatencyMs.roundToInt()
+
     @SuppressLint("MissingPermission")
     private fun queuePayload(payload: ByteArray, rawMessage: String): Boolean {
         val gatt = bluetoothGatt
@@ -419,12 +495,14 @@ class BleManager(private val context: Context) {
         }
 
         val ok = gatt.writeCharacteristic(characteristic, nextChunk, characteristic.writeType) == BluetoothStatusCodes.SUCCESS
+        writeStartedAtMs[characteristic.hashCode()] = System.currentTimeMillis()
         Log.d(
             TAG,
             "flushNextWrite ok=$ok bytes=${nextChunk.size} writeType=${characteristic.writeType} queueRemaining=${writeQueue.size}"
         )
         if (!ok) {
             isOperationInFlight = false
+            writeStartedAtMs.remove(characteristic.hashCode())
             _statusDetail.value = "Write failed to enqueue at GATT layer"
         }
     }

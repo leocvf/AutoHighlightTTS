@@ -8,4 +8,7 @@ object X4BleUuids {
 
     // TODO(X4 firmware): replace placeholder UUID with the real writable command characteristic UUID.
     val X4_COMMAND_CHARACTERISTIC_UUID: UUID = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
+
+    // Optional notify characteristic used for feedback packets such as ACK/NACK.
+    val X4_FEEDBACK_CHARACTERISTIC_UUID: UUID = UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb")
 }
