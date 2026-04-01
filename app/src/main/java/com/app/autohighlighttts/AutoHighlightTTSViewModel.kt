@@ -25,6 +25,7 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     private val ttsSyncBridge = TtsSyncBridge(bleManager)
 
     val connectionState: StateFlow<String> = bleManager.connectionState
+    val bleStatusDetail: StateFlow<String> = bleManager.statusDetail
 
     init {
         initTTS(context)

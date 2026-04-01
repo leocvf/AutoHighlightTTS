@@ -94,6 +94,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
         val context = LocalContext.current
         val scope = rememberCoroutineScope()
         val connectionState by viewModel.connectionState.collectAsState()
+        val bleStatusDetail by viewModel.bleStatusDetail.collectAsState()
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions()
         ) { _ -> }
@@ -159,6 +160,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
             Spacer(modifier = Modifier.height(20.dp))
             BleTestPanel(
                 connectionState = connectionState,
+                statusDetail = bleStatusDetail,
                 onConnect = {
                     if (viewModel.hasRequiredBlePermissions()) {
                         viewModel.connectBle()
@@ -183,6 +185,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
 @Composable
 private fun BleTestPanel(
     connectionState: String,
+    statusDetail: String,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onPing: () -> Unit,
@@ -197,6 +200,11 @@ private fun BleTestPanel(
             .padding(vertical = 8.dp)
     ) {
         Text(text = "BLE Test Panel: $connectionState")
+        Text(
+            text = "Details: $statusDetail",
+            fontSize = 12.sp,
+            color = Color.Gray
+        )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = onConnect) { Text("Connect") }
             Button(onClick = onDisconnect) { Text("Disconnect") }
@@ -393,4 +401,3 @@ fun ComposableLifecycle(
         }
     }
 }
-

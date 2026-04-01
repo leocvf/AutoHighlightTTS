@@ -35,6 +35,7 @@ class BleManager(private val context: Context) {
         private const val ATT_WRITE_OVERHEAD = 3
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val RECONNECT_DELAY_MS = 2_000L
+        private const val SCAN_TIMEOUT_MS = 12_000L
     }
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
@@ -57,18 +58,24 @@ class BleManager(private val context: Context) {
 
     private val _connectionState = MutableStateFlow("DISCONNECTED")
     val connectionState: StateFlow<String> = _connectionState
+    private val _statusDetail = MutableStateFlow("Idle")
+    val statusDetail: StateFlow<String> = _statusDetail
 
     @Volatile
     private var isScanning: Boolean = false
+    private var discoveredCount: Int = 0
+    private var serviceFilterEnabled: Boolean = true
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, "onConnectionStateChange status=$status newState=$newState")
+            _statusDetail.value = "GATT state changed: status=$status newState=$newState"
             when (newState) {
                 BluetoothGatt.STATE_CONNECTED -> {
                     reconnectAttempts = 0
                     _connectionState.value = "CONNECTED"
+                    _statusDetail.value = "Connected to ${gatt.device.address}; requesting MTU and services"
                     gatt.requestMtu(247)
                     gatt.discoverServices()
                 }
@@ -101,6 +108,7 @@ class BleManager(private val context: Context) {
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             Log.d(TAG, "onServicesDiscovered status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                _statusDetail.value = "Service discovery failed: status=$status"
                 return
             }
             val service: BluetoothGattService? = gatt.getService(X4BleUuids.X4_SERVICE_UUID)
@@ -109,8 +117,10 @@ class BleManager(private val context: Context) {
 
             if (commandCharacteristic != null) {
                 _connectionState.value = "READY"
+                _statusDetail.value = "Command characteristic discovered"
             } else {
                 _connectionState.value = "CONNECTED_NO_CHAR"
+                _statusDetail.value = "Connected but command characteristic not found"
             }
             Log.d(TAG, "commandCharacteristicFound=${commandCharacteristic != null}")
         }
@@ -122,6 +132,7 @@ class BleManager(private val context: Context) {
             status: Int
         ) {
             Log.d(TAG, "onCharacteristicWrite uuid=${characteristic.uuid} status=$status")
+            _statusDetail.value = "Last write status=$status queueRemaining=${writeQueue.size}"
             isOperationInFlight = false
             flushNextWrite()
         }
@@ -131,7 +142,10 @@ class BleManager(private val context: Context) {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val name = result.device.name ?: result.scanRecord?.deviceName.orEmpty()
+            discoveredCount += 1
             Log.d(TAG, "onScanResult name=$name address=${result.device.address}")
+            _statusDetail.value =
+                "Found ${result.device.address} name='${name.ifBlank { "unknown" }}' rssi=${result.rssi} count=$discoveredCount filterByService=$serviceFilterEnabled"
             if (name.contains(TARGET_HINT, ignoreCase = true)) {
                 stopScan()
                 connect(result.device)
@@ -141,6 +155,7 @@ class BleManager(private val context: Context) {
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "onScanFailed errorCode=$errorCode")
             _connectionState.value = "SCAN_FAILED_$errorCode"
+            _statusDetail.value = "Scan failed with code=$errorCode"
             isScanning = false
         }
     }
@@ -180,16 +195,24 @@ class BleManager(private val context: Context) {
 
         _connectionState.value = "SCANNING"
         isScanning = true
+        discoveredCount = 0
+        _statusDetail.value = "Starting scan; requires device name containing '$TARGET_HINT'"
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        val filters = listOf(
-            ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(X4BleUuids.X4_SERVICE_UUID))
-                .build()
-        )
+        val filters = if (serviceFilterEnabled) {
+            listOf(
+                ScanFilter.Builder()
+                    .setServiceUuid(ParcelUuid(X4BleUuids.X4_SERVICE_UUID))
+                    .build()
+            )
+        } else {
+            emptyList()
+        }
         scanner?.startScan(filters, settings, scanCallback)
-        Log.d(TAG, "BLE scan started")
+        mainHandler.removeCallbacks(scanTimeoutRunnable)
+        mainHandler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
+        Log.d(TAG, "BLE scan started filterByService=$serviceFilterEnabled")
     }
 
     @SuppressLint("MissingPermission")
@@ -197,6 +220,7 @@ class BleManager(private val context: Context) {
         if (!isScanning) return
         scanner?.stopScan(scanCallback)
         isScanning = false
+        mainHandler.removeCallbacks(scanTimeoutRunnable)
         Log.d(TAG, "BLE scan stopped")
     }
 
@@ -208,6 +232,7 @@ class BleManager(private val context: Context) {
         }
         lastConnectedDevice = device
         _connectionState.value = "CONNECTING"
+        _statusDetail.value = "Connecting to ${device.address} (${device.name ?: "unknown"})"
         bluetoothGatt?.close()
         bluetoothGatt = device.connectGatt(context, false, gattCallback)
         Log.d(TAG, "connect to ${device.address}")
@@ -224,6 +249,7 @@ class BleManager(private val context: Context) {
         val characteristic = commandCharacteristic
         if (gatt == null || characteristic == null) {
             Log.w(TAG, "writeJson skipped: connection not ready payload=$rawMessage")
+            _statusDetail.value = "Write skipped because connection is not READY"
             return false
         }
 
@@ -270,6 +296,7 @@ class BleManager(private val context: Context) {
         )
         if (!ok) {
             isOperationInFlight = false
+            _statusDetail.value = "Write failed to enqueue at GATT layer"
         }
     }
 
@@ -281,6 +308,7 @@ class BleManager(private val context: Context) {
         }
         reconnectAttempts += 1
         _connectionState.value = "RECONNECTING_$reconnectAttempts"
+        _statusDetail.value = "Disconnected; reconnect attempt $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS in ${RECONNECT_DELAY_MS}ms"
         mainHandler.postDelayed(
             {
                 Log.d(TAG, "Reconnect attempt $reconnectAttempts")
@@ -302,6 +330,25 @@ class BleManager(private val context: Context) {
         isOperationInFlight = false
         writeQueue.clear()
         _connectionState.value = "DISCONNECTED"
+        _statusDetail.value = "Disconnected by user"
         Log.d(TAG, "BLE disconnected")
+    }
+
+    private val scanTimeoutRunnable = Runnable {
+        if (!isScanning) {
+            return@Runnable
+        }
+        stopScan()
+        if (serviceFilterEnabled) {
+            serviceFilterEnabled = false
+            _connectionState.value = "SCANNING_RETRY_NO_FILTER"
+            _statusDetail.value =
+                "No matching result with service UUID after ${SCAN_TIMEOUT_MS / 1000}s; retrying unfiltered scan"
+            scanAndConnect()
+        } else {
+            _connectionState.value = "SCAN_TIMEOUT"
+            _statusDetail.value =
+                "No device matched name '$TARGET_HINT'. Check advertising name/UUID, bonding, and distance."
+        }
     }
 }
