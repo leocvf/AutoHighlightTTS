@@ -23,9 +23,12 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Button
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -35,6 +38,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -89,6 +93,10 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
 
         val context = LocalContext.current
         val scope = rememberCoroutineScope()
+        val connectionState by viewModel.connectionState.collectAsState()
+        val permissionLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestMultiplePermissions()
+        ) { _ -> }
 
         tts.setOnCompletionListener {
             Log.e("TAG", "TTSScreen: Completed From Callback")
@@ -149,10 +157,64 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
                 )
             }
             Spacer(modifier = Modifier.height(20.dp))
+            BleTestPanel(
+                connectionState = connectionState,
+                onConnect = {
+                    if (viewModel.hasRequiredBlePermissions()) {
+                        viewModel.connectBle()
+                    } else {
+                        permissionLauncher.launch(viewModel.requiredBlePermissions())
+                    }
+                },
+                onDisconnect = viewModel::disconnectBle,
+                onPing = viewModel::sendPing,
+                onClear = viewModel::sendClear,
+                onLoadSample = viewModel::loadSampleText,
+                onPosition = viewModel::sendPosition
+            )
+            Spacer(modifier = Modifier.height(16.dp))
             BottomStorySection(tts)
         }
     } ?: Box(contentAlignment = Alignment.Center) {
         CircularProgressIndicator()
+    }
+}
+
+@Composable
+private fun BleTestPanel(
+    connectionState: String,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onPing: () -> Unit,
+    onClear: () -> Unit,
+    onLoadSample: () -> Unit,
+    onPosition: (Int, Int) -> Unit
+) {
+    var slider by remember { mutableFloatStateOf(0f) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+    ) {
+        Text(text = "BLE Test Panel: $connectionState")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onConnect) { Text("Connect") }
+            Button(onClick = onDisconnect) { Text("Disconnect") }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onPing) { Text("Send Ping") }
+            Button(onClick = onClear) { Text("Send Clear") }
+            Button(onClick = onLoadSample) { Text("Load Sample Text") }
+        }
+        Slider(
+            value = slider,
+            valueRange = 0f..200f,
+            onValueChange = {
+                slider = it
+                val start = it.toInt()
+                onPosition(start, (start + 8).coerceAtMost(200))
+            }
+        )
     }
 }
 
@@ -331,5 +393,4 @@ fun ComposableLifecycle(
         }
     }
 }
-
 
