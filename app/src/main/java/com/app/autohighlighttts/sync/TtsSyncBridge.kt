@@ -30,6 +30,8 @@ class TtsSyncBridge(
     private var lastPositionSentAt = 0L
     private var activeSegments: List<TextSegment> = emptyList()
     private var activeSegmentIndex: Int = -1
+    private var sourceDocumentText: String = ""
+    private var lastHighlightedPayload: String? = null
 
     private data class TextSegment(
         val docId: String,
@@ -43,6 +45,8 @@ class TtsSyncBridge(
     fun sendClear() {
         activeSegments = emptyList()
         activeSegmentIndex = -1
+        sourceDocumentText = ""
+        lastHighlightedPayload = null
         sendPacket(JSONObject().put("type", "clear"))
     }
 
@@ -51,6 +55,8 @@ class TtsSyncBridge(
             docId = newDocId
             activeSegments = emptyList()
             activeSegmentIndex = -1
+            sourceDocumentText = ""
+            lastHighlightedPayload = null
         }
     }
 
@@ -59,14 +65,16 @@ class TtsSyncBridge(
             Log.w(TAG, "loadDocumentTextOnce ignored (blank text)")
             return false
         }
+        sourceDocumentText = text
+        lastHighlightedPayload = null
         val segments = buildLoadTextSegments(text)
         if (segments.isEmpty()) {
             Log.w(TAG, "loadDocumentTextOnce produced no chunks")
             return false
         }
         activeSegments = segments
-        activeSegmentIndex = 0
-        return sendLoadTextSegment(activeSegmentIndex)
+        activeSegmentIndex = -1
+        return true
     }
 
     fun onSpokenRangeChanged(start: Int, end: Int) {
@@ -83,17 +91,18 @@ class TtsSyncBridge(
                 delay(debounceMs)
             }
 
+            if (!sendPositionPackets) {
+                sendHighlightedRangeAsLoadText(range.first, range.second)
+                lastPositionSentAt = SystemClock.elapsedRealtime()
+                return@launch
+            }
+
             val targetChunkIndex = findSegmentIndex(range.first)
             if (targetChunkIndex >= 0 && targetChunkIndex != activeSegmentIndex) {
                 val switched = sendLoadTextSegment(targetChunkIndex)
                 if (!switched) {
                     Log.w(TAG, "Failed to switch chunk for position range=$range index=$targetChunkIndex")
                 }
-            }
-
-            if (!sendPositionPackets) {
-                lastPositionSentAt = SystemClock.elapsedRealtime()
-                return@launch
             }
 
             val activeChunk = activeSegments.getOrNull(activeSegmentIndex)
@@ -114,6 +123,29 @@ class TtsSyncBridge(
 
     fun close() {
         scope.coroutineContext.cancel()
+    }
+
+
+    private fun sendHighlightedRangeAsLoadText(start: Int, end: Int) {
+        if (sourceDocumentText.isBlank()) return
+
+        val safeStart = start.coerceIn(0, sourceDocumentText.length)
+        val safeEnd = end.coerceIn(safeStart, sourceDocumentText.length)
+        if (safeEnd <= safeStart) return
+
+        val highlightedText = sourceDocumentText.substring(safeStart, safeEnd)
+        val payloadKey = "$safeStart:$safeEnd:$highlightedText"
+        if (payloadKey == lastHighlightedPayload) {
+            return
+        }
+
+        val packet = JSONObject()
+            .put("type", "load_text")
+            .put("docId", "$docId#live")
+            .put("text", highlightedText)
+
+        sendPacket(packet)
+        lastHighlightedPayload = payloadKey
     }
 
     private fun sendPacket(packet: JSONObject) {
