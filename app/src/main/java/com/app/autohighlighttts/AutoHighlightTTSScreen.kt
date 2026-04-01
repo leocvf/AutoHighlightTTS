@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -72,12 +73,16 @@ import com.app.autohighlighttts.ble.BleManager.ScannedDevice
 import com.app.autohighlighttts.ui.theme.Amaranth
 import com.app.autohighlighttts.ui.theme.fontFamily
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 import com.app.autohighlightttssample.R
 
 
 @Composable
-fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
+fun TTSScreen(
+    modifier: Modifier = Modifier,
+    viewModel: AutoHighlightTTSViewModel = hiltViewModel()
+) {
 
     var instanceOfTTS by remember { mutableStateOf<AutoHighlightTTSEngine?>(null) }
     LaunchedEffect(instanceOfTTS == null) {
@@ -136,8 +141,35 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
             Log.e("TAG", "TTSScreen: onEachSentenceStart is called")
         }
 
+        var editableText by remember(tts.mainText) { mutableStateOf(tts.mainText) }
+        var pitch by remember { mutableFloatStateOf(1f) }
+        var speed by remember { mutableFloatStateOf(1f) }
+        var fontSize by remember { mutableFloatStateOf(20f) }
+        var textAlign by remember { mutableStateOf(TextAlign.Center) }
+        var engineMenuExpanded by remember { mutableStateOf(false) }
+        var voiceMenuExpanded by remember { mutableStateOf(false) }
+        var alignmentMenuExpanded by remember { mutableStateOf(false) }
+        var selectedEngine by remember { mutableStateOf<String?>(null) }
+        var selectedVoice by remember { mutableStateOf<String?>(null) }
+        var engines by remember { mutableStateOf(viewModel.availableEngines()) }
+        var voices by remember { mutableStateOf(viewModel.availableVoices()) }
+        val epubPickerLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            uri?.let {
+                val loaded = viewModel.loadEpub(it)
+                if (loaded.isNotBlank()) {
+                    editableText = loaded
+                    scope.launch {
+                        Toast.makeText(context, "EPUB loaded", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+
         Column(
-            Modifier
+            modifier
+                .fillMaxSize()
                 .fillMaxWidth()
                 .background(Color.White)
                 .padding(horizontal = 20.dp)
@@ -154,6 +186,150 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
                     .padding(top = 50.dp, bottom = 20.dp),
                 textAlign = TextAlign.Center
             )
+            OutlinedTextField(
+                value = editableText,
+                onValueChange = { editableText = it },
+                label = { Text("Text to read") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { viewModel.updateNarrationText(editableText) },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Apply Text") }
+                Button(
+                    onClick = { viewModel.loadSampleText() },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Sync to Device") }
+            }
+            Button(
+                onClick = { epubPickerLauncher.launch(arrayOf("application/epub+zip")) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+            ) {
+                Text("Load EPUB")
+            }
+            ExposedDropdownMenuBox(
+                expanded = engineMenuExpanded,
+                onExpandedChange = { engineMenuExpanded = !engineMenuExpanded },
+                modifier = Modifier.padding(top = 8.dp)
+            ) {
+                OutlinedTextField(
+                    value = selectedEngine ?: "Select TTS engine",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("TTS Engine") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = engineMenuExpanded) },
+                    modifier = Modifier
+                        .menuAnchor(type = MenuAnchorType.PrimaryNotEditable, enabled = true)
+                        .fillMaxWidth()
+                )
+                ExposedDropdownMenu(expanded = engineMenuExpanded, onDismissRequest = { engineMenuExpanded = false }) {
+                    engines.forEach { engine ->
+                        DropdownMenuItem(
+                            text = { Text(engine.label ?: engine.name) },
+                            onClick = {
+                                selectedEngine = engine.label ?: engine.name
+                                engineMenuExpanded = false
+                                viewModel.selectEngine(engine.name)
+                                scope.launch {
+                                    delay(500)
+                                    voices = viewModel.availableVoices()
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+            ExposedDropdownMenuBox(
+                expanded = voiceMenuExpanded,
+                onExpandedChange = { voiceMenuExpanded = !voiceMenuExpanded },
+                modifier = Modifier.padding(top = 8.dp)
+            ) {
+                OutlinedTextField(
+                    value = selectedVoice ?: "Select voice",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Voice") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = voiceMenuExpanded) },
+                    modifier = Modifier
+                        .menuAnchor(type = MenuAnchorType.PrimaryNotEditable, enabled = true)
+                        .fillMaxWidth()
+                )
+                ExposedDropdownMenu(expanded = voiceMenuExpanded, onDismissRequest = { voiceMenuExpanded = false }) {
+                    voices.forEach { voice ->
+                        val voiceLabel = "${voice.locale.displayName} • ${voice.name}"
+                        DropdownMenuItem(
+                            text = { Text(voiceLabel) },
+                            onClick = {
+                                selectedVoice = voiceLabel
+                                voiceMenuExpanded = false
+                                viewModel.selectVoice(voice.name)
+                            }
+                        )
+                    }
+                }
+            }
+            ExposedDropdownMenuBox(
+                expanded = alignmentMenuExpanded,
+                onExpandedChange = { alignmentMenuExpanded = !alignmentMenuExpanded },
+                modifier = Modifier.padding(top = 8.dp)
+            ) {
+                OutlinedTextField(
+                    value = textAlign.name,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Text alignment") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = alignmentMenuExpanded) },
+                    modifier = Modifier
+                        .menuAnchor(type = MenuAnchorType.PrimaryNotEditable, enabled = true)
+                        .fillMaxWidth()
+                )
+                ExposedDropdownMenu(expanded = alignmentMenuExpanded, onDismissRequest = { alignmentMenuExpanded = false }) {
+                    listOf(TextAlign.Start, TextAlign.Center, TextAlign.End, TextAlign.Justify).forEach { align ->
+                        DropdownMenuItem(
+                            text = { Text(align.name) },
+                            onClick = {
+                                textAlign = align
+                                alignmentMenuExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+            Text(text = "Text Size: ${fontSize.roundToInt()}sp", modifier = Modifier.padding(top = 8.dp))
+            Slider(
+                value = fontSize,
+                valueRange = 14f..36f,
+                onValueChange = { fontSize = it }
+            )
+            Text(
+                text = "Voice Pitch: ${"%.1f".format(pitch)}",
+                modifier = Modifier.padding(top = 8.dp)
+            )
+            Slider(
+                value = pitch,
+                valueRange = 0.5f..2f,
+                onValueChange = {
+                    pitch = it
+                    viewModel.updatePitchAndSpeed(pitch, speed)
+                }
+            )
+            Text(text = "Voice Speed: ${"%.1f".format(speed)}")
+            Slider(
+                value = speed,
+                valueRange = 0.5f..2f,
+                onValueChange = {
+                    speed = it
+                    viewModel.updatePitchAndSpeed(pitch, speed)
+                }
+            )
 
             Box(
                 Modifier
@@ -163,7 +339,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
             ) {
                 AutoHighlightTTSComposable(
                     tts = tts,
-                    textAlign = TextAlign.Center,
+                    textAlign = textAlign,
                     fontFamily = fontFamily,
                     fontWeight = FontWeight.ExtraLight,
                     autoHighlightTTSBuilder = AutoHighlightTTSBuilder(
@@ -176,7 +352,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
                         )
                     ),
                     style = TextStyle(
-                        fontSize = 20.sp, color = Color.Black,
+                        fontSize = fontSize.sp, color = Color.Black,
                         lineHeight = 35.sp
                     ),
                 )

@@ -3,21 +3,18 @@ package com.app.autohighlighttts
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import com.app.autohighlighttts.ui.theme.MITextToSpeechTheme
 import dagger.hilt.android.AndroidEntryPoint
 
@@ -27,37 +24,39 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             MITextToSpeechTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    var showBluetoothScreen by remember { mutableStateOf(false) }
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        Button(
-                            onClick = { showBluetoothScreen = !showBluetoothScreen },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp)
-                        ) {
-                            Text(if (showBluetoothScreen) "Back to TTS" else "Open Bluetooth Scanner")
-                        }
-
-                        Column(
-                            modifier = Modifier.fillMaxSize(),
-                            verticalArrangement = Arrangement.Top
-                        ) {
-                            if (showBluetoothScreen) {
-                                BluetoothDiscoveryScreen()
-                            } else {
-                                TTSScreen()
-                            }
-                        }
-                    }
-                }
+                UsableAppShell()
             }
         }
     }
 }
 
+private enum class HomeDestination(val label: String) {
+    Reader("Reader"),
+    Devices("Devices")
+}
 
+@Composable
+private fun UsableAppShell() {
+    var destination by remember { mutableStateOf(HomeDestination.Reader) }
 
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
+        bottomBar = {
+            NavigationBar {
+                HomeDestination.entries.forEach { item ->
+                    NavigationBarItem(
+                        selected = destination == item,
+                        onClick = { destination = item },
+                        label = { Text(item.label) },
+                        icon = {}
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        when (destination) {
+            HomeDestination.Reader -> TTSScreen(modifier = Modifier.padding(innerPadding))
+            HomeDestination.Devices -> BluetoothDiscoveryScreen(modifier = Modifier.padding(innerPadding))
+        }
+    }
+}
