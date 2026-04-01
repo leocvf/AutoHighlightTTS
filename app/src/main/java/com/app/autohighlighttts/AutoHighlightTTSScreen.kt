@@ -354,8 +354,35 @@ fun TTSScreen(
                             }
                         )
                     }
+                    item {
+                        BleTestPanel(
+                            connectionState = connectionState,
+                            statusDetail = bleStatusDetail,
+                            onConnect = {
+                                if (viewModel.hasRequiredBlePermissions()) {
+                                    viewModel.scanBleDevices(includeAllDevices = true)
+                                } else {
+                                    pendingBleScanAfterPermission = true
+                                    permissionLauncher.launch(viewModel.requiredBlePermissions())
+                                }
+                            },
+                            devices = scannedDevices,
+                            onConnectDevice = viewModel::connectBle,
+                            onDisconnect = viewModel::disconnectBle,
+                            onPing = viewModel::sendPing,
+                            onClear = viewModel::sendClear,
+                            onLoadSample = viewModel::loadSampleText,
+                            onPosition = viewModel::sendPosition
+                        )
+                    }
                 }
             } else {
+                Text(
+                    text = "Reader mode",
+                    color = Color.Gray,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
                 Box(
                     Modifier
                         .weight(1f)
@@ -382,24 +409,11 @@ fun TTSScreen(
                     ),
                 )
                 }
-                BleTestPanel(
-                    connectionState = connectionState,
-                    statusDetail = bleStatusDetail,
-                    onConnect = {
-                        if (viewModel.hasRequiredBlePermissions()) {
-                            viewModel.scanBleDevices(includeAllDevices = true)
-                        } else {
-                            pendingBleScanAfterPermission = true
-                            permissionLauncher.launch(viewModel.requiredBlePermissions())
-                        }
-                    },
-                    devices = scannedDevices,
-                    onConnectDevice = viewModel::connectBle,
-                    onDisconnect = viewModel::disconnectBle,
-                    onPing = viewModel::sendPing,
-                    onClear = viewModel::sendClear,
-                    onLoadSample = viewModel::loadSampleText,
-                    onPosition = viewModel::sendPosition
+                Text(
+                    text = "Connection: $connectionState",
+                    color = Color.Gray,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 6.dp)
                 )
                 Spacer(modifier = Modifier.height(8.dp))
             }

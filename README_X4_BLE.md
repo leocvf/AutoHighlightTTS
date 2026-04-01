@@ -12,6 +12,8 @@ This app includes an MVP BLE client that sends Remote TTS JSON commands to Cross
   - `{"type":"position","docId":"demo-001","start":N,"end":M}`
 - Supports write queue + reconnect attempts.
 - Splits large payloads into MTU-aware chunks.
+- For large documents, the app sends MTU-safe `load_text` chunks and keeps `position`
+  updates aligned to the active chunk (so each BLE write is valid JSON for firmware parsing).
 - Debounces position updates (~150ms) to avoid flooding.
 - Logs BLE lifecycle + every outbound command.
 

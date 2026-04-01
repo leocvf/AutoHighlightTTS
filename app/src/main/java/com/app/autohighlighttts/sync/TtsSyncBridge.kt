@@ -39,11 +39,17 @@ class TtsSyncBridge(
 
     fun sendPing() = sendPacket(JSONObject().put("type", "ping"))
 
-    fun sendClear() = sendPacket(JSONObject().put("type", "clear"))
+    fun sendClear() {
+        activeChunks = emptyList()
+        activeChunkIndex = -1
+        sendPacket(JSONObject().put("type", "clear"))
+    }
 
     fun setDocId(newDocId: String) {
         if (newDocId.isNotBlank()) {
             docId = newDocId
+            activeChunks = emptyList()
+            activeChunkIndex = -1
         }
     }
 
@@ -88,7 +94,7 @@ class TtsSyncBridge(
             val startOffset = activeChunk?.startOffset ?: 0
             val endOffset = activeChunk?.endOffsetExclusive ?: Int.MAX_VALUE
             val localStart = (range.first - startOffset).coerceAtLeast(0)
-            val localEnd = (range.second - startOffset).coerceIn(0, endOffset - startOffset)
+            val localEnd = (range.second - startOffset).coerceIn(localStart, endOffset - startOffset)
 
             val packet = JSONObject()
                 .put("type", "position")
@@ -136,32 +142,55 @@ class TtsSyncBridge(
         var start = 0
         var chunkIndex = 0
         while (start < text.length) {
-            var end = text.length
-            while (end > start) {
-                val candidate = text.substring(start, end)
-                val packet = JSONObject()
-                    .put("type", "load_text")
-                    .put("docId", "$docId#$chunkIndex")
-                    .put("text", candidate)
-                if (packet.toString().toByteArray(Charsets.UTF_8).size <= maxPayloadBytes) {
-                    chunks.add(
-                        TextChunk(
-                            docId = "$docId#$chunkIndex",
-                            text = candidate,
-                            startOffset = start,
-                            endOffsetExclusive = end
-                        )
-                    )
-                    start = end
-                    chunkIndex++
-                    break
-                }
-                end -= 1
-            }
-            if (end == start) {
+            val chunkDocId = "$docId#$chunkIndex"
+            val end = findChunkEndIndex(text, start, maxPayloadBytes, chunkDocId)
+            if (end <= start) {
                 break
             }
+            val candidate = text.substring(start, end)
+            chunks.add(
+                TextChunk(
+                    docId = chunkDocId,
+                    text = candidate,
+                    startOffset = start,
+                    endOffsetExclusive = end
+                )
+            )
+            start = end
+            chunkIndex++
         }
         return chunks
+    }
+
+    private fun findChunkEndIndex(text: String, start: Int, maxPayloadBytes: Int, chunkDocId: String): Int {
+        var low = start + 1
+        var high = text.length
+        var best = -1
+
+        while (low <= high) {
+            val mid = (low + high) / 2
+            val candidate = text.substring(start, mid)
+            val payloadBytes = JSONObject()
+                .put("type", "load_text")
+                .put("docId", chunkDocId)
+                .put("text", candidate)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+                .size
+            if (payloadBytes <= maxPayloadBytes) {
+                best = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+
+        if (best <= start) return start
+        val preferredSplit = text.substring(start, best).indexOfLast { it == ' ' || it == '\n' }
+        return if (preferredSplit > 20) {
+            start + preferredSplit + 1
+        } else {
+            best
+        }
     }
 }
