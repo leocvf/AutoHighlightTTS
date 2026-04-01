@@ -375,7 +375,7 @@ class BleManager(private val context: Context) {
             _connectionState.value = "SCANNING_RETRY_NO_FILTER"
             _statusDetail.value =
                 "No matching result with service UUID after ${SCAN_TIMEOUT_MS / 1000}s; retrying unfiltered scan"
-            scanForDevices()
+            scanForDevices(includeAllDevices = true)
         } else {
             _connectionState.value = "SCAN_TIMEOUT"
             _statusDetail.value =
