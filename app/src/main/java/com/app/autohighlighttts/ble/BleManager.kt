@@ -16,6 +16,7 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -78,6 +79,7 @@ class BleManager(private val context: Context) {
     private var isScanning: Boolean = false
     private var discoveredCount: Int = 0
     private var serviceFilterEnabled: Boolean = true
+    private var continuousScanEnabled: Boolean = false
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
@@ -268,14 +270,20 @@ class BleManager(private val context: Context) {
         }
 
         serviceFilterEnabled = !includeAllDevices
+        continuousScanEnabled = includeAllDevices
         _connectionState.value = "SCANNING"
         isScanning = true
         discoveredCount = 0
         _scannedDevices.value = emptyList()
-        _statusDetail.value = if (serviceFilterEnabled) {
-            "Starting filtered scan for service ${X4BleUuids.X4_SERVICE_UUID}"
+        val locationWarning = if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R && !isLocationEnabled()) {
+            " Location appears OFF; Android 11 and below may hide BLE results until Location is enabled."
         } else {
-            "Starting broad scan to discover any nearby BLE device"
+            ""
+        }
+        _statusDetail.value = if (serviceFilterEnabled) {
+            "Starting filtered scan for service ${X4BleUuids.X4_SERVICE_UUID}.$locationWarning"
+        } else {
+            "Starting broad scan to discover any nearby BLE device.$locationWarning"
         }
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -292,7 +300,9 @@ class BleManager(private val context: Context) {
         }
         bleScanner.startScan(filters, settings, scanCallback)
         mainHandler.removeCallbacks(scanTimeoutRunnable)
-        mainHandler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
+        if (!continuousScanEnabled) {
+            mainHandler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
+        }
         Log.d(TAG, "BLE scan started filterByService=$serviceFilterEnabled")
     }
 
@@ -319,8 +329,20 @@ class BleManager(private val context: Context) {
         if (!isScanning) return
         scanner?.stopScan(scanCallback)
         isScanning = false
+        continuousScanEnabled = false
         mainHandler.removeCallbacks(scanTimeoutRunnable)
         Log.d(TAG, "BLE scan stopped")
+    }
+
+    private fun isLocationEnabled(): Boolean {
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            ?: return true
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            locationManager.isLocationEnabled
+        } else {
+            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        }
     }
 
     @SuppressLint("MissingPermission")
