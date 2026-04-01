@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -61,6 +63,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.app.autohighlighttts.composable.AutoHighlightTTSBuilder
+import com.app.autohighlighttts.ble.BleManager.ScannedDevice
 import com.app.autohighlighttts.ui.theme.Amaranth
 import com.app.autohighlighttts.ui.theme.fontFamily
 import kotlinx.coroutines.launch
@@ -95,6 +98,7 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
         val scope = rememberCoroutineScope()
         val connectionState by viewModel.connectionState.collectAsState()
         val bleStatusDetail by viewModel.bleStatusDetail.collectAsState()
+        val scannedDevices by viewModel.scannedDevices.collectAsState()
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions()
         ) { _ -> }
@@ -163,11 +167,13 @@ fun TTSScreen(viewModel: AutoHighlightTTSViewModel = hiltViewModel()) {
                 statusDetail = bleStatusDetail,
                 onConnect = {
                     if (viewModel.hasRequiredBlePermissions()) {
-                        viewModel.connectBle()
+                        viewModel.scanBleDevices()
                     } else {
                         permissionLauncher.launch(viewModel.requiredBlePermissions())
                     }
                 },
+                devices = scannedDevices,
+                onConnectDevice = viewModel::connectBle,
                 onDisconnect = viewModel::disconnectBle,
                 onPing = viewModel::sendPing,
                 onClear = viewModel::sendClear,
@@ -187,6 +193,8 @@ private fun BleTestPanel(
     connectionState: String,
     statusDetail: String,
     onConnect: () -> Unit,
+    devices: List<ScannedDevice>,
+    onConnectDevice: (ScannedDevice) -> Unit,
     onDisconnect: () -> Unit,
     onPing: () -> Unit,
     onClear: () -> Unit,
@@ -206,8 +214,30 @@ private fun BleTestPanel(
             color = Color.Gray
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = onConnect) { Text("Connect") }
+            Button(onClick = onConnect) { Text("Scan Devices") }
             Button(onClick = onDisconnect) { Text("Disconnect") }
+        }
+        if (devices.isNotEmpty()) {
+            Text(
+                text = "Tap a device to connect:",
+                fontSize = 12.sp,
+                color = Color.Gray,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+            LazyColumn(modifier = Modifier.height(120.dp)) {
+                items(devices, key = { it.address }) { device ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onConnectDevice(device) }
+                            .padding(vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(text = "${device.name} (${device.address})", fontSize = 12.sp)
+                        Text(text = "${device.rssi} dBm", fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+            }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = onPing) { Text("Send Ping") }

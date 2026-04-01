@@ -21,12 +21,20 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
 import java.util.ArrayDeque
 
 class BleManager(private val context: Context) {
+
+    data class ScannedDevice(
+        val bluetoothDevice: BluetoothDevice,
+        val name: String,
+        val address: String,
+        val rssi: Int
+    )
 
     companion object {
         private const val TAG = "BleManager"
@@ -60,6 +68,8 @@ class BleManager(private val context: Context) {
     val connectionState: StateFlow<String> = _connectionState
     private val _statusDetail = MutableStateFlow("Idle")
     val statusDetail: StateFlow<String> = _statusDetail
+    private val _scannedDevices = MutableStateFlow<List<ScannedDevice>>(emptyList())
+    val scannedDevices = _scannedDevices.asStateFlow()
 
     @Volatile
     private var isScanning: Boolean = false
@@ -146,10 +156,7 @@ class BleManager(private val context: Context) {
             Log.d(TAG, "onScanResult name=$name address=${result.device.address}")
             _statusDetail.value =
                 "Found ${result.device.address} name='${name.ifBlank { "unknown" }}' rssi=${result.rssi} count=$discoveredCount filterByService=$serviceFilterEnabled"
-            if (matchesTargetName(name)) {
-                stopScan()
-                connect(result.device)
-            }
+            upsertScannedDevice(result.device, name, result.rssi)
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -178,10 +185,10 @@ class BleManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun scanAndConnect() {
+    fun scanForDevices() {
         if (!hasRequiredPermissions()) {
             _connectionState.value = "MISSING_PERMISSION"
-            Log.w(TAG, "scanAndConnect blocked: missing permissions")
+            Log.w(TAG, "scanForDevices blocked: missing permissions")
             return
         }
         if (isScanning) return
@@ -189,13 +196,14 @@ class BleManager(private val context: Context) {
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
             _connectionState.value = "BT_DISABLED"
-            Log.w(TAG, "scanAndConnect blocked: bluetooth disabled")
+            Log.w(TAG, "scanForDevices blocked: bluetooth disabled")
             return
         }
 
         _connectionState.value = "SCANNING"
         isScanning = true
         discoveredCount = 0
+        _scannedDevices.value = emptyList()
         _statusDetail.value = "Starting scan; expected names include ${TARGET_NAME_HINTS.joinToString()}"
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -215,8 +223,22 @@ class BleManager(private val context: Context) {
         Log.d(TAG, "BLE scan started filterByService=$serviceFilterEnabled")
     }
 
-    private fun matchesTargetName(name: String): Boolean {
-        return TARGET_NAME_HINTS.any { hint -> name.contains(hint, ignoreCase = true) }
+    private fun upsertScannedDevice(device: BluetoothDevice, name: String, rssi: Int) {
+        val normalizedName = name.ifBlank { "Unknown" }
+        val updated = _scannedDevices.value.toMutableList()
+        val index = updated.indexOfFirst { it.address == device.address }
+        val record = ScannedDevice(
+            bluetoothDevice = device,
+            name = normalizedName,
+            address = device.address,
+            rssi = rssi
+        )
+        if (index >= 0) {
+            updated[index] = record
+        } else {
+            updated.add(record)
+        }
+        _scannedDevices.value = updated.sortedByDescending { it.rssi }
     }
 
     @SuppressLint("MissingPermission")
@@ -348,11 +370,11 @@ class BleManager(private val context: Context) {
             _connectionState.value = "SCANNING_RETRY_NO_FILTER"
             _statusDetail.value =
                 "No matching result with service UUID after ${SCAN_TIMEOUT_MS / 1000}s; retrying unfiltered scan"
-            scanAndConnect()
+            scanForDevices()
         } else {
             _connectionState.value = "SCAN_TIMEOUT"
             _statusDetail.value =
-                "No device matched name '$TARGET_HINT'. Check advertising name/UUID, bonding, and distance."
+                "No BLE device found. Check advertising name/UUID, bonding, and distance."
         }
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import com.app.autohighlighttts.ble.BleManager
+import com.app.autohighlighttts.ble.BleManager.ScannedDevice
 import com.app.autohighlighttts.sync.TtsSyncBridge
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -26,6 +27,7 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
 
     val connectionState: StateFlow<String> = bleManager.connectionState
     val bleStatusDetail: StateFlow<String> = bleManager.statusDetail
+    val scannedDevices: StateFlow<List<ScannedDevice>> = bleManager.scannedDevices
 
     init {
         initTTS(context)
@@ -53,7 +55,9 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
 
     fun hasRequiredBlePermissions(): Boolean = bleManager.hasRequiredPermissions()
 
-    fun connectBle() = bleManager.scanAndConnect()
+    fun scanBleDevices() = bleManager.scanForDevices()
+
+    fun connectBle(device: ScannedDevice) = bleManager.connect(device.bluetoothDevice)
 
     fun disconnectBle() = bleManager.disconnect()
 
