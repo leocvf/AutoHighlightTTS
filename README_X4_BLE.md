@@ -28,6 +28,8 @@ For `leocvf/crosspoint-enhanced-reading-mod`, the required streaming keys are:
 `stream_start.startOffset`, `stream_chunk.seq`, `stream_chunk.offset`,
 `stream_commit.uptoSeq`, and `stream_seek.offset`. The Android app includes these
 plus compatibility aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mixed firmware builds.
+The stream sequence baseline is intentionally 1-based (`startSeq=1`, first `stream_chunk.seq=1`)
+because some receiver builds treat `seq=0` as a sentinel/non-committable baseline.
 
 ### Chunking and pacing
 - Chunks are sentence-aware first, then word-boundary aware.
@@ -57,7 +59,7 @@ plus compatibility aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mi
 - `includeAliasFields=true` (temporary default): emits canonical keys (`seq`, `offset`,
   `uptoSeq`) plus aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mixed firmware.
 - `requireAckForCommit=false` (default): allows non-ACK commit progression using contiguous sent seq.
-- `explicitStartSeq=true` (default): sends `stream_start.startSeq` aligned to first chunk seq (0).
+- `explicitStartSeq=true` (default): sends `stream_start.startSeq` aligned to first emitted chunk seq (1).
 
 ### Migration plan
 1. Keep `includeAliasFields=true` until all deployed firmware parses canonical keys only.
