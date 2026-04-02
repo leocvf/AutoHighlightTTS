@@ -33,13 +33,18 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     val streamingModeEnabled: StateFlow<Boolean> = _streamingModeEnabled.asStateFlow()
     private var currentDocId: String = "doc-default"
     private var ttsSyncBridge: TtsSyncBridge = createSyncBridge(_streamingModeEnabled.value)
+    private val _bleStreamDebugState = MutableStateFlow(TtsSyncBridge.DebugState(false, -1, -1, 0, 0, 0))
+    val bleStreamDebugState: StateFlow<TtsSyncBridge.DebugState> = _bleStreamDebugState.asStateFlow()
 
     val connectionState: StateFlow<String> = bleManager.connectionState
     val bleStatusDetail: StateFlow<String> = bleManager.statusDetail
     val scannedDevices: StateFlow<List<ScannedDevice>> = bleManager.scannedDevices
 
     init {
-        ttsSyncBridge.setAckModeEnabled(true)
+        ttsSyncBridge.setDebugStateListener { _bleStreamDebugState.value = it }
+        bleManager.onFeedbackChannelReady = { ready ->
+            ttsSyncBridge.setFeedbackChannelReady(ready)
+        }
         bleManager.onFeedbackPacket = { packet ->
             if (packet.optString("type") == "ack") {
                 val sequenceId = when {
@@ -72,7 +77,8 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
         ttsSyncBridge.close()
         _streamingModeEnabled.value = enabled
         ttsSyncBridge = createSyncBridge(enabled)
-        ttsSyncBridge.setAckModeEnabled(true)
+        ttsSyncBridge.setDebugStateListener { _bleStreamDebugState.value = it }
+        bleManager.onFeedbackChannelReady = { ready -> ttsSyncBridge.setFeedbackChannelReady(ready) }
         ttsSyncBridge.setDocId(currentDocId)
         ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
     }

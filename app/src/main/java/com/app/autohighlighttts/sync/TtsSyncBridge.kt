@@ -22,7 +22,12 @@ class TtsSyncBridge(
     private val debounceMs: Long = 150L,
     private val sendPositionPackets: Boolean = true,
     private val streamingEnabled: Boolean = true,
-    private val streamVersion: Int = 2
+    private val streamVersion: Int = 2,
+    private val compatibilityProfile: CompatibilityProfile = CompatibilityProfile(),
+    private val ackFallbackTimeoutMs: Long = 1_200L,
+    private val ackRetryBaseMs: Long = 900L,
+    private val maxChunkRetries: Int = 3,
+    private val retryQueueDepthCircuitBreaker: Int = 14
 ) {
     constructor(
         bleManager: BleManager,
@@ -30,14 +35,16 @@ class TtsSyncBridge(
         debounceMs: Long = 150L,
         sendPositionPackets: Boolean = true,
         streamingEnabled: Boolean = true,
-        streamVersion: Int = 2
+        streamVersion: Int = 2,
+        compatibilityProfile: CompatibilityProfile = CompatibilityProfile()
     ) : this(
         transport = BleCommandTransport(bleManager),
         docId = docId,
         debounceMs = debounceMs,
         sendPositionPackets = sendPositionPackets,
         streamingEnabled = streamingEnabled,
-        streamVersion = streamVersion
+        streamVersion = streamVersion,
+        compatibilityProfile = compatibilityProfile
     )
 
     interface CommandTransport {
@@ -46,6 +53,21 @@ class TtsSyncBridge(
         fun pendingWriteCount(): Int
         fun meanWriteLatencyMs(): Int
     }
+
+    data class CompatibilityProfile(
+        val includeAliasFields: Boolean = true,
+        val requireAckForCommit: Boolean = false,
+        val explicitStartSeq: Boolean = true
+    )
+
+    data class DebugState(
+        val ackModeEnabled: Boolean,
+        val lastAckSeq: Int,
+        val committedSeq: Int,
+        val pendingQueue: Int,
+        val inFlightCount: Int,
+        val retriesCount: Int
+    )
 
     private class BleCommandTransport(private val bleManager: BleManager) : CommandTransport {
         override fun writeJson(packet: JSONObject): Boolean = bleManager.writeJson(packet)
@@ -59,8 +81,7 @@ class TtsSyncBridge(
         private const val MIN_LOOKAHEAD_CHUNKS = 2
         private const val MAX_LOOKAHEAD_CHUNKS = 5
         private const val MIN_BUFFERED_CHARS = 360
-        private const val ACK_TIMEOUT_MS = 900L
-        private const val MAX_RETRY = 2
+        private const val TELEMETRY_INTERVAL_MS = 500L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -69,6 +90,7 @@ class TtsSyncBridge(
     private var positionJob: Job? = null
     private var senderJob: Job? = null
     private var ackMonitorJob: Job? = null
+    private var telemetryJob: Job? = null
     private var lastPositionSentAt = 0L
     private var sourceDocumentText: String = ""
     private var lastHighlightedPayload: String? = null
@@ -77,12 +99,21 @@ class TtsSyncBridge(
 
     private var session: StreamSession? = null
     private var ackModeEnabled: Boolean = false
+    private var feedbackChannelReady: Boolean = false
+    private var ackObservedThisSession: Boolean = false
+    private var streamStartAtMs: Long = 0L
+    private var lastAckSeq: Int = -1
     private var lastSeekOffset: Int = 0
 
     private val outboundQueue = ArrayDeque<JSONObject>()
     private val ackWaiting = ConcurrentHashMap<Int, InFlightChunk>()
     private val sentChunkSeqs = mutableSetOf<Int>()
+    private val ackedChunkSeqs = mutableSetOf<Int>()
+    private val invalidatedChunkSeqs = mutableSetOf<Int>()
     private var committedSeq = -1
+    private var highestSentSeq = -1
+    private var highestContiguousSentSeq = -1
+    private var highestContiguousAckedSeq = -1
 
     private var tokenBucket = 4.0
     private var lastRefillMs = SystemClock.elapsedRealtime()
@@ -92,7 +123,8 @@ class TtsSyncBridge(
         val docId: String,
         val streamVersion: Int,
         val totalChars: Int,
-        val chunks: List<StreamChunk>
+        val chunks: List<StreamChunk>,
+        val startSeq: Int
     )
 
     internal data class StreamChunk(
@@ -108,7 +140,8 @@ class TtsSyncBridge(
     private data class InFlightChunk(
         val chunk: StreamChunk,
         var lastSentAtMs: Long,
-        var retryCount: Int
+        var retryCount: Int,
+        var nextRetryAtMs: Long
     )
 
     private data class LegacyChunk(
@@ -119,13 +152,21 @@ class TtsSyncBridge(
 
     internal data class StreamMetrics(
         var chunksSent: Int = 0,
-        var chunksRetried: Int = 0,
-        var droppedChunks: Int = 0,
-        var resyncCount: Int = 0,
+        var retries: Int = 0,
+        var dropped: Int = 0,
+        var queueDepth: Int = 0,
+        var meanWriteLatency: Int = 0,
+        var ackGap: Int = 0,
         var seekCount: Int = 0
     )
 
     private val metrics = StreamMetrics()
+    private var onDebugStateChanged: ((DebugState) -> Unit)? = null
+
+    fun setDebugStateListener(listener: ((DebugState) -> Unit)?) {
+        onDebugStateChanged = listener
+        publishDebugState()
+    }
 
     fun sendPing() = enqueuePacket(JSONObject().put("type", "ping"))
 
@@ -141,16 +182,27 @@ class TtsSyncBridge(
         }
     }
 
-    fun setAckModeEnabled(enabled: Boolean) {
-        ackModeEnabled = enabled
+    fun setFeedbackChannelReady(ready: Boolean) {
+        feedbackChannelReady = ready
+        if (!ready) {
+            ackModeEnabled = false
+            ackObservedThisSession = false
+        }
+        publishDebugState()
     }
 
     fun onAckReceived(sequenceId: Int) {
-        if (!ackModeEnabled) return
-        ackWaiting.remove(sequenceId)
-        while (ackWaiting[committedSeq + 1] == null && committedSeq + 1 in sentChunkSeqs) {
-            committedSeq += 1
+        if (sequenceId < 0) return
+        lastAckSeq = max(lastAckSeq, sequenceId)
+        ackObservedThisSession = true
+        if (feedbackChannelReady) {
+            ackModeEnabled = true
         }
+        ackWaiting.remove(sequenceId)
+        ackedChunkSeqs += sequenceId
+        recalculateContiguousState()
+        sendStreamCommit()
+        publishDebugState()
     }
 
     fun loadDocumentTextOnce(text: String): Boolean {
@@ -177,19 +229,31 @@ class TtsSyncBridge(
             return false
         }
 
+        val firstSeq = chunks.first().sequenceId
         session = StreamSession(
             sessionId = UUID.randomUUID().toString(),
             docId = docId,
             streamVersion = streamVersion,
             totalChars = text.length,
-            chunks = chunks
+            chunks = chunks,
+            startSeq = if (compatibilityProfile.explicitStartSeq) firstSeq else 0
         )
+        streamStartAtMs = SystemClock.elapsedRealtime()
         committedSeq = -1
+        highestSentSeq = -1
+        highestContiguousSentSeq = -1
+        highestContiguousAckedSeq = -1
+        lastAckSeq = -1
+        ackObservedThisSession = false
+        ackModeEnabled = false
         sentChunkSeqs.clear()
+        ackedChunkSeqs.clear()
+        invalidatedChunkSeqs.clear()
         ackWaiting.clear()
         sendStreamStart()
         ensureBufferAround(0)
         startAckMonitorIfNeeded()
+        startTelemetryIfNeeded()
         return true
     }
 
@@ -232,8 +296,8 @@ class TtsSyncBridge(
         val safeEnd = end.coerceIn(safeStart, currentSession.totalChars)
         if (kotlin.math.abs(safeStart - lastSeekOffset) > 420) {
             metrics.seekCount += 1
-            metrics.resyncCount += 1
             sendStreamSeek(safeStart, safeEnd)
+            invalidateChunkWindowAround(safeStart)
         }
         lastSeekOffset = safeStart
         ensureBufferAround(safeStart)
@@ -242,39 +306,62 @@ class TtsSyncBridge(
 
     private fun sendStreamStart() {
         val s = session ?: return
-        enqueuePacket(
-            JSONObject()
-                .put("type", "stream_start")
-                .put("sessionId", s.sessionId)
-                .put("docId", s.docId)
-                .put("startOffset", 0)
-                .put("streamVersion", s.streamVersion)
-                .put("totalChars", s.totalChars)
-                .put("chunkCount", s.chunks.size)
-        )
+        val packet = JSONObject()
+            .put("type", "stream_start")
+            .put("sessionId", s.sessionId)
+            .put("docId", s.docId)
+            .put("startOffset", 0)
+            .put("streamVersion", s.streamVersion)
+            .put("totalChars", s.totalChars)
+            .put("chunkCount", s.chunks.size)
+        if (compatibilityProfile.explicitStartSeq) {
+            packet.put("startSeq", s.startSeq)
+        }
+        enqueuePacket(packet)
     }
 
     private fun sendStreamSeek(start: Int, end: Int) {
         val s = session ?: return
-        enqueuePacket(
-            JSONObject()
-                .put("type", "stream_seek")
-                .put("sessionId", s.sessionId)
-                .put("offset", start)
-                .put("start", start)
-                .put("end", end)
-        )
+        val packet = JSONObject()
+            .put("type", "stream_seek")
+            .put("sessionId", s.sessionId)
+            .put("offset", start)
+        if (compatibilityProfile.includeAliasFields) {
+            packet.put("start", start)
+            packet.put("end", end)
+        }
+        enqueuePacket(packet)
     }
 
     private fun sendStreamCommit() {
         val s = session ?: return
-        enqueuePacket(
-            JSONObject()
-                .put("type", "stream_commit")
-                .put("sessionId", s.sessionId)
-                .put("uptoSeq", committedSeq)
-                .put("committedSeq", committedSeq)
+        val effectiveCommitted = if (shouldUseAckForCommit()) highestContiguousAckedSeq else highestContiguousSentSeq
+        committedSeq = max(committedSeq, effectiveCommitted)
+        if (committedSeq < 0) {
+            Log.d(
+                TAG,
+                "stream_commit skip mode=${if (shouldUseAckForCommit()) "ack" else "non-ack"} committedSeq=$committedSeq highestSentSeq=$highestSentSeq ackWaiting=${ackWaiting.size}"
+            )
+            return
+        }
+
+        val packet = JSONObject()
+            .put("type", "stream_commit")
+            .put("sessionId", s.sessionId)
+            .put("uptoSeq", committedSeq)
+        if (compatibilityProfile.includeAliasFields) {
+            packet.put("committedSeq", committedSeq)
+        }
+        enqueuePacket(packet)
+        Log.d(
+            TAG,
+            "stream_commit mode=${if (shouldUseAckForCommit()) "ack" else "non-ack"} committedSeq=$committedSeq highestSentSeq=$highestSentSeq ackWaiting=${ackWaiting.size}"
         )
+        publishDebugState()
+    }
+
+    private fun shouldUseAckForCommit(): Boolean {
+        return ackModeEnabled && (feedbackChannelReady || compatibilityProfile.requireAckForCommit)
     }
 
     private fun sendStreamChunk(chunk: StreamChunk, reason: String) {
@@ -285,22 +372,38 @@ class TtsSyncBridge(
             .put("docId", s.docId)
             .put("seq", chunk.sequenceId)
             .put("offset", chunk.startOffset)
-            .put("sequenceId", chunk.sequenceId)
             .put("chunkId", chunk.chunkId)
-            .put("start", chunk.startOffset)
-            .put("end", chunk.endOffsetExclusive)
             .put("checksum", chunk.checksum)
             .put("text", chunk.text)
+
+        if (compatibilityProfile.includeAliasFields) {
+            packet.put("sequenceId", chunk.sequenceId)
+            packet.put("start", chunk.startOffset)
+            packet.put("end", chunk.endOffsetExclusive)
+        }
+
         enqueuePacket(packet)
 
         sentChunkSeqs += chunk.sequenceId
-        if (ackModeEnabled) {
-            ackWaiting[chunk.sequenceId] = InFlightChunk(chunk, SystemClock.elapsedRealtime(), 0)
-        } else {
-            committedSeq = max(committedSeq, chunk.sequenceId)
+        invalidatedChunkSeqs.remove(chunk.sequenceId)
+        highestSentSeq = max(highestSentSeq, chunk.sequenceId)
+
+        if (shouldUseAckForCommit()) {
+            val now = SystemClock.elapsedRealtime()
+            ackWaiting[chunk.sequenceId] = InFlightChunk(
+                chunk = chunk,
+                lastSentAtMs = now,
+                retryCount = 0,
+                nextRetryAtMs = now + ackRetryBaseMs
+            )
+        }
+        recalculateContiguousState()
+        if (!shouldUseAckForCommit()) {
+            sendStreamCommit()
         }
         metrics.chunksSent += 1
-        Log.d(TAG, "stream_chunk queued seq=${chunk.sequenceId} reason=$reason")
+        publishDebugState()
+        Log.v(TAG, "stream_chunk queued seq=${chunk.sequenceId} reason=$reason")
     }
 
     private fun sendStreamEnd() {
@@ -327,8 +430,11 @@ class TtsSyncBridge(
         var bufferedChars = 0
         for (i in startIndex..endIndex) {
             val chunk = s.chunks[i]
-            val alreadyQueued = sentChunkSeqs.contains(chunk.sequenceId)
-            if (!alreadyQueued) {
+            val isInflight = ackWaiting.containsKey(chunk.sequenceId)
+            val alreadySent = sentChunkSeqs.contains(chunk.sequenceId)
+            val isAcked = ackedChunkSeqs.contains(chunk.sequenceId)
+            val forceResend = invalidatedChunkSeqs.contains(chunk.sequenceId) && !isInflight && !isAcked
+            if ((!alreadySent && !isInflight) || forceResend) {
                 sendStreamChunk(chunk, reason = if (i == centerIndex) "focus" else "window")
             }
             if (chunk.endOffsetExclusive > globalOffset) {
@@ -340,11 +446,40 @@ class TtsSyncBridge(
             val refillEnd = (endIndex + 2).coerceAtMost(s.chunks.lastIndex)
             for (i in (endIndex + 1)..refillEnd) {
                 val chunk = s.chunks[i]
-                if (!sentChunkSeqs.contains(chunk.sequenceId)) {
+                if (!sentChunkSeqs.contains(chunk.sequenceId) && !ackWaiting.containsKey(chunk.sequenceId)) {
                     sendStreamChunk(chunk, reason = "refill")
                 }
             }
         }
+    }
+
+    private fun invalidateChunkWindowAround(globalOffset: Int) {
+        val s = session ?: return
+        val centerIndex = findChunkIndexForOffset(s.chunks, globalOffset)
+        val start = (centerIndex - 1).coerceAtLeast(0)
+        val end = (centerIndex + 2).coerceAtMost(s.chunks.lastIndex)
+        for (idx in start..end) {
+            val seq = s.chunks[idx].sequenceId
+            if (!ackedChunkSeqs.contains(seq) && !ackWaiting.containsKey(seq)) {
+                invalidatedChunkSeqs += seq
+                sentChunkSeqs.remove(seq)
+            }
+        }
+    }
+
+    private fun recalculateContiguousState() {
+        var seq = 0
+        while (sentChunkSeqs.contains(seq)) {
+            seq++
+        }
+        highestContiguousSentSeq = seq - 1
+
+        seq = 0
+        while (ackedChunkSeqs.contains(seq)) {
+            seq++
+        }
+        highestContiguousAckedSeq = seq - 1
+        metrics.ackGap = (highestContiguousSentSeq - highestContiguousAckedSeq).coerceAtLeast(0)
     }
 
     private fun findChunkIndexForOffset(chunks: List<StreamChunk>, globalOffset: Int): Int {
@@ -355,6 +490,7 @@ class TtsSyncBridge(
 
     private fun enqueuePacket(packet: JSONObject) {
         outboundQueue.add(packet)
+        publishDebugState()
         if (senderJob?.isActive != true) {
             senderJob = scope.launch { drainOutboundQueue() }
         }
@@ -371,20 +507,17 @@ class TtsSyncBridge(
             val packet = outboundQueue.removeFirstOrNull() ?: continue
             val sent = transport.writeJson(packet)
             tokenBucket -= 1.0
-            val depth = transport.pendingWriteCount()
-            val latency = transport.meanWriteLatencyMs()
-            Log.d(
-                TAG,
-                "stream_tx sent=$sent depth=$depth latencyMs=$latency payload=$packet metrics=$metrics"
-            )
+            metrics.queueDepth = transport.pendingWriteCount()
+            metrics.meanWriteLatency = transport.meanWriteLatencyMs()
             if (!sent) {
-                metrics.droppedChunks += 1
+                metrics.dropped += 1
                 delay(35)
-            } else if (depth > 6 || latency > 65) {
+            } else if (metrics.queueDepth > 6 || metrics.meanWriteLatency > 65) {
                 delay(30)
             } else {
                 delay(8)
             }
+            publishDebugState()
         }
     }
 
@@ -404,21 +537,69 @@ class TtsSyncBridge(
     }
 
     private fun startAckMonitorIfNeeded() {
-        if (!ackModeEnabled || ackMonitorJob?.isActive == true) return
+        if (ackMonitorJob?.isActive == true) return
         ackMonitorJob = scope.launch {
             while (isActive) {
-                delay(200)
+                delay(80)
+                if (session == null) continue
+
                 val now = SystemClock.elapsedRealtime()
-                ackWaiting.values.forEach { inFlight ->
-                    if (now - inFlight.lastSentAtMs >= ACK_TIMEOUT_MS && inFlight.retryCount < MAX_RETRY) {
-                        inFlight.retryCount += 1
-                        inFlight.lastSentAtMs = now
-                        metrics.chunksRetried += 1
-                        sendStreamChunk(inFlight.chunk, reason = "retry")
-                    }
+                if (!ackObservedThisSession && now - streamStartAtMs >= ackFallbackTimeoutMs) {
+                    ackModeEnabled = false
                 }
+
+                val retryBlocked = transport.pendingWriteCount() >= retryQueueDepthCircuitBreaker
+                ackWaiting.entries.forEach { entry ->
+                    val inFlight = entry.value
+                    if (retryBlocked || now < inFlight.nextRetryAtMs) return@forEach
+
+                    if (inFlight.retryCount >= maxChunkRetries) {
+                        ackWaiting.remove(entry.key)
+                        metrics.dropped += 1
+                        return@forEach
+                    }
+
+                    inFlight.retryCount += 1
+                    inFlight.lastSentAtMs = now
+                    val multiplier = 1L shl (inFlight.retryCount - 1)
+                    inFlight.nextRetryAtMs = now + ackRetryBaseMs * multiplier
+                    metrics.retries += 1
+                    sendStreamChunk(inFlight.chunk, reason = "retry")
+                }
+                recalculateContiguousState()
+                if (!shouldUseAckForCommit()) {
+                    sendStreamCommit()
+                }
+                publishDebugState()
             }
         }
+    }
+
+    private fun startTelemetryIfNeeded() {
+        if (telemetryJob?.isActive == true) return
+        telemetryJob = scope.launch {
+            while (isActive) {
+                delay(TELEMETRY_INTERVAL_MS)
+                if (session == null) continue
+                Log.d(
+                    TAG,
+                    "stream_telemetry {ackModeEnabled=$ackModeEnabled,lastAckSeq=$lastAckSeq,committedSeq=$committedSeq,chunksSent=${metrics.chunksSent},retries=${metrics.retries},dropped=${metrics.dropped},queueDepth=${metrics.queueDepth},meanWriteLatency=${metrics.meanWriteLatency},ackGap=${metrics.ackGap},pending=${outboundQueue.size},inFlight=${ackWaiting.size}}"
+                )
+            }
+        }
+    }
+
+    private fun publishDebugState() {
+        onDebugStateChanged?.invoke(
+            DebugState(
+                ackModeEnabled = ackModeEnabled,
+                lastAckSeq = lastAckSeq,
+                committedSeq = committedSeq,
+                pendingQueue = outboundQueue.size,
+                inFlightCount = ackWaiting.size,
+                retriesCount = metrics.retries
+            )
+        )
     }
 
     private fun sendFallbackPosition(start: Int, end: Int) {
@@ -530,9 +711,18 @@ class TtsSyncBridge(
         outboundQueue.clear()
         ackWaiting.clear()
         sentChunkSeqs.clear()
+        ackedChunkSeqs.clear()
+        invalidatedChunkSeqs.clear()
         committedSeq = -1
+        highestSentSeq = -1
+        highestContiguousSentSeq = -1
+        highestContiguousAckedSeq = -1
+        lastAckSeq = -1
         lastSeekOffset = 0
         lastHighlightedPayload = null
+        ackModeEnabled = false
+        ackObservedThisSession = false
+        publishDebugState()
     }
 
     internal fun buildStreamChunks(
@@ -647,12 +837,14 @@ class TtsSyncBridge(
             .put("docId", "d")
             .put("seq", 1)
             .put("offset", 0)
-            .put("sequenceId", 1)
             .put("chunkId", 1)
-            .put("start", 0)
-            .put("end", chunkText.length)
             .put("checksum", chunkText.hashCode())
             .put("text", chunkText)
+        if (compatibilityProfile.includeAliasFields) {
+            probe.put("sequenceId", 1)
+            probe.put("start", 0)
+            probe.put("end", chunkText.length)
+        }
         return probe.toString().toByteArray(Charsets.UTF_8).size <= maxJsonBytes
     }
 

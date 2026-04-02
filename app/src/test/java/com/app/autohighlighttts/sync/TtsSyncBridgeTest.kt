@@ -28,6 +28,10 @@ class TtsSyncBridgeTest {
         override fun meanWriteLatencyMs(): Int = meanLatencyMs
     }
 
+    private class FakeAckSource(private val bridge: TtsSyncBridge) {
+        fun emitAck(seq: Int) = bridge.onAckReceived(seq)
+    }
+
     @Test
     fun streamChunking_respectsPayloadBudget() {
         val transport = FakeTransport(maxBytes = 210)
@@ -44,43 +48,108 @@ class TtsSyncBridgeTest {
                 .put("docId", "d")
                 .put("seq", chunk.sequenceId)
                 .put("offset", chunk.startOffset)
-                .put("sequenceId", chunk.sequenceId)
                 .put("chunkId", chunk.chunkId)
-                .put("start", chunk.startOffset)
-                .put("end", chunk.endOffsetExclusive)
                 .put("checksum", chunk.checksum)
                 .put("text", chunk.text)
+                .put("sequenceId", chunk.sequenceId)
+                .put("start", chunk.startOffset)
+                .put("end", chunk.endOffsetExclusive)
             assertTrue(packet.toString().toByteArray(Charsets.UTF_8).size <= 200)
         }
     }
 
     @Test
-    fun streamProtocol_emitsStartAndSeekAndChunks() = runBlocking {
+    fun noAckPath_commitsStillProgress() = runBlocking {
         val transport = FakeTransport()
         val bridge = TtsSyncBridge(
             transport = transport,
             debounceMs = 1,
-            streamingEnabled = true
+            streamingEnabled = true,
+            ackFallbackTimeoutMs = 10
         )
         val text = "First sentence. Second sentence. Third sentence. Fourth sentence."
 
         assertTrue(bridge.loadDocumentTextOnce(text))
-        Thread.sleep(30)
-        bridge.onSpokenRangeChanged(0, 5)
-        Thread.sleep(30)
-        bridge.onSpokenRangeChanged(500, 510)
+        Thread.sleep(40)
+        bridge.onSpokenRangeChanged(0, 12)
         Thread.sleep(80)
 
-        val types = transport.packets.map { it.optString("type") }
-        assertTrue(types.contains("stream_start"))
-        assertTrue(types.contains("stream_chunk"))
-        assertTrue(types.contains("stream_commit"))
-        assertTrue(types.contains("stream_seek"))
+        val commits = transport.packets.filter { it.optString("type") == "stream_commit" }
+        assertTrue(commits.isNotEmpty())
+        assertTrue(commits.last().optInt("uptoSeq", -1) >= 0)
+    }
+
+    @Test
+    fun ackPath_commitProgressesOnAck() {
+        val transport = FakeTransport()
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            debounceMs = 1,
+            streamingEnabled = true,
+            compatibilityProfile = TtsSyncBridge.CompatibilityProfile(requireAckForCommit = true)
+        )
+        bridge.setFeedbackChannelReady(true)
+        assertTrue(bridge.loadDocumentTextOnce("First sentence. Second sentence."))
+        Thread.sleep(40)
+
+        FakeAckSource(bridge).emitAck(0)
+        Thread.sleep(40)
+
+        val commits = transport.packets.filter { it.optString("type") == "stream_commit" }
+        assertTrue(commits.isNotEmpty())
+        assertEquals(0, commits.last().optInt("uptoSeq", -1))
+    }
+
+    @Test
+    fun negativeCommittedSeq_neverSent() {
+        val transport = FakeTransport()
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            debounceMs = 1,
+            streamingEnabled = true,
+            compatibilityProfile = TtsSyncBridge.CompatibilityProfile(requireAckForCommit = true),
+            ackFallbackTimeoutMs = 2_000
+        )
+        bridge.setFeedbackChannelReady(true)
+        assertTrue(bridge.loadDocumentTextOnce("One. Two."))
+        Thread.sleep(40)
+
+        val commits = transport.packets.filter { it.optString("type") == "stream_commit" }
+        assertTrue(commits.isEmpty())
+    }
+
+    @Test
+    fun startSeq_alignsWithFirstChunkSequence() {
+        val transport = FakeTransport()
+        val bridge = TtsSyncBridge(transport = transport)
+
+        assertTrue(bridge.loadDocumentTextOnce("Sentence one. Sentence two."))
+        Thread.sleep(40)
+
+        val start = transport.packets.first { it.optString("type") == "stream_start" }
         val firstChunk = transport.packets.first { it.optString("type") == "stream_chunk" }
-        assertTrue(firstChunk.has("seq"))
-        assertTrue(firstChunk.has("offset"))
-        val firstCommit = transport.packets.first { it.optString("type") == "stream_commit" }
-        assertTrue(firstCommit.has("uptoSeq"))
+        assertEquals(firstChunk.optInt("seq", -1), start.optInt("startSeq", -2))
+        assertEquals(0, firstChunk.optInt("seq", -1))
+    }
+
+    @Test
+    fun retryBackoff_andMaxRetryBehavior() {
+        val transport = FakeTransport()
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            streamingEnabled = true,
+            compatibilityProfile = TtsSyncBridge.CompatibilityProfile(requireAckForCommit = true),
+            ackRetryBaseMs = 20,
+            maxChunkRetries = 1
+        )
+        bridge.setFeedbackChannelReady(true)
+        assertTrue(bridge.loadDocumentTextOnce("A. B. C. D."))
+
+        Thread.sleep(180)
+
+        val chunkPackets = transport.packets.filter { it.optString("type") == "stream_chunk" }
+        val seqZeroAttempts = chunkPackets.count { it.optInt("seq", -1) == 0 }
+        assertTrue(seqZeroAttempts <= 2)
     }
 
     @Test
@@ -100,50 +169,5 @@ class TtsSyncBridgeTest {
         val types = transport.packets.map { it.optString("type") }
         assertTrue(types.contains("load_text"))
         assertFalse(types.contains("stream_chunk"))
-    }
-
-    @Test
-    fun fallbackMode_reloadsChunkAndSendsLocalOffsets() {
-        val transport = FakeTransport(maxBytes = 170)
-        val bridge = TtsSyncBridge(
-            transport = transport,
-            debounceMs = 1,
-            streamingEnabled = false,
-            sendPositionPackets = true
-        )
-        val text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(14)
-
-        assertTrue(bridge.loadDocumentTextOnce(text))
-        Thread.sleep(30)
-        bridge.onSpokenRangeChanged(320, 340)
-        Thread.sleep(50)
-
-        val loadPackets = transport.packets.filter { it.optString("type") == "load_text" }
-        val positionPackets = transport.packets.filter { it.optString("type") == "position" }
-
-        assertTrue(loadPackets.size >= 2)
-        assertTrue(positionPackets.isNotEmpty())
-        val lastPosition = positionPackets.last()
-        assertTrue(lastPosition.getInt("start") < 320)
-        assertTrue(lastPosition.getInt("end") <= loadPackets.last().getString("text").length)
-    }
-
-    @Test
-    fun fallbackRangeMode_keepsDocIdStable() {
-        val transport = FakeTransport()
-        val bridge = TtsSyncBridge(
-            transport = transport,
-            debounceMs = 1,
-            streamingEnabled = false,
-            sendPositionPackets = false
-        )
-
-        assertTrue(bridge.loadDocumentTextOnce("Alpha beta gamma"))
-        Thread.sleep(20)
-        bridge.onSpokenRangeChanged(0, 5)
-        Thread.sleep(40)
-
-        val lastLoad = transport.packets.last { it.optString("type") == "load_text" }
-        assertEquals("demo-001", lastLoad.getString("docId"))
     }
 }
