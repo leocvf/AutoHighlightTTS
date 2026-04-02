@@ -78,6 +78,9 @@ class TtsSyncBridge(
 
     companion object {
         private const val TAG = "TtsSyncBridge"
+        // Some receiver builds treat seq=0 as "no chunks committed yet".
+        // Starting at 1 keeps the first chunk commit-eligible across those implementations.
+        private const val STREAM_SEQUENCE_BASE = 1
         private const val MIN_LOOKAHEAD_CHUNKS = 2
         private const val MAX_LOOKAHEAD_CHUNKS = 5
         private const val MIN_BUFFERED_CHARS = 360
@@ -468,13 +471,14 @@ class TtsSyncBridge(
     }
 
     private fun recalculateContiguousState() {
-        var seq = 0
+        val baselineSeq = session?.startSeq ?: STREAM_SEQUENCE_BASE
+        var seq = baselineSeq
         while (sentChunkSeqs.contains(seq)) {
             seq++
         }
         highestContiguousSentSeq = seq - 1
 
-        seq = 0
+        seq = baselineSeq
         while (ackedChunkSeqs.contains(seq)) {
             seq++
         }
@@ -737,7 +741,7 @@ class TtsSyncBridge(
         }
 
         val chunks = mutableListOf<StreamChunk>()
-        var sequence = 0
+        var sequence = STREAM_SEQUENCE_BASE
         var chunkId = 0
         var currentStart = -1
         var currentEnd = -1
@@ -780,7 +784,11 @@ class TtsSyncBridge(
         }
         flush(sentenceTail = true)
 
-        return chunks.flatMap { splitChunkIfNeeded(it, maxJsonBytes) }
+        val splitChunks = chunks.flatMap { splitChunkIfNeeded(it, maxJsonBytes) }
+        // Reindex after split expansion so emitted seq values are strictly increasing with no duplicates.
+        return splitChunks.mapIndexed { index, chunk ->
+            chunk.copy(sequenceId = STREAM_SEQUENCE_BASE + index)
+        }
     }
 
     private fun splitChunkIfNeeded(chunk: StreamChunk, maxJsonBytes: Int): List<StreamChunk> {
