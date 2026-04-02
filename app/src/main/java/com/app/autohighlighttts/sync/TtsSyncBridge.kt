@@ -14,7 +14,9 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.random.Random
 
 class TtsSyncBridge(
     private val transport: CommandTransport,
@@ -52,6 +54,8 @@ class TtsSyncBridge(
         fun maxPayloadBytes(): Int
         fun pendingWriteCount(): Int
         fun meanWriteLatencyMs(): Int
+        fun isReady(): Boolean
+        fun reconnectLightweight(reason: String): Boolean
     }
 
     data class CompatibilityProfile(
@@ -66,7 +70,21 @@ class TtsSyncBridge(
         val committedSeq: Int,
         val pendingQueue: Int,
         val inFlightCount: Int,
-        val retriesCount: Int
+        val retriesCount: Int,
+        val legacySummary: String = ""
+    )
+
+    data class LegacyTransportProfile(
+        val maxPayloadBytes: Int,
+        val writeIntervalMs: Long,
+        val positionDebounceMs: Long,
+        val maxInFlightWrites: Int,
+        val reconnectBackoffMs: List<Long>,
+        val queueCapacity: Int = 96,
+        val meaningfulRangeDeltaChars: Int = 2,
+        val loadQuietPeriodMs: Long = 220L,
+        val writeRetryLimit: Int = 3,
+        val writeTimeoutMs: Long = 300L
     )
 
     private class BleCommandTransport(private val bleManager: BleManager) : CommandTransport {
@@ -74,6 +92,8 @@ class TtsSyncBridge(
         override fun maxPayloadBytes(): Int = bleManager.maxPayloadBytes()
         override fun pendingWriteCount(): Int = bleManager.pendingWriteCount()
         override fun meanWriteLatencyMs(): Int = bleManager.meanWriteLatencyMs()
+        override fun isReady(): Boolean = bleManager.isReady()
+        override fun reconnectLightweight(reason: String): Boolean = bleManager.requestLightweightReconnect(reason)
     }
 
     companion object {
@@ -85,6 +105,22 @@ class TtsSyncBridge(
         private const val MAX_LOOKAHEAD_CHUNKS = 5
         private const val MIN_BUFFERED_CHARS = 360
         private const val TELEMETRY_INTERVAL_MS = 500L
+    }
+
+    private fun activeLegacyProfile(): LegacyTransportProfile {
+        val maxPayload = (transport.maxPayloadBytes() - 8).coerceAtLeast(90)
+        val writeInterval = when {
+            transport.meanWriteLatencyMs() > 70 -> 34L
+            transport.meanWriteLatencyMs() > 35 -> 22L
+            else -> 12L
+        }
+        return LegacyTransportProfile(
+            maxPayloadBytes = maxPayload,
+            writeIntervalMs = writeInterval,
+            positionDebounceMs = debounceMs.coerceAtLeast(120L),
+            maxInFlightWrites = 1,
+            reconnectBackoffMs = listOf(250L, 600L, 1_200L, 2_000L)
+        )
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -99,6 +135,11 @@ class TtsSyncBridge(
     private var lastHighlightedPayload: String? = null
     private var legacyChunks: List<LegacyChunk> = emptyList()
     private var activeLegacyChunkIndex: Int = -1
+    private var lastSentPosition: Pair<Int, Int>? = null
+    private var deferredLegacySeekDuringLoad: Pair<Int, Int>? = null
+    private var legacyLoadInProgress: Boolean = false
+    private var legacyLoadJob: Job? = null
+    private var legacyReconnectCount = 0
 
     private var session: StreamSession? = null
     private var ackModeEnabled: Boolean = false
@@ -108,7 +149,15 @@ class TtsSyncBridge(
     private var lastAckSeq: Int = -1
     private var lastSeekOffset: Int = 0
 
-    private val outboundQueue = ArrayDeque<JSONObject>()
+    private enum class PacketKind { LOAD_TEXT, POSITION, OTHER }
+
+    private data class OutboundPacket(
+        val packet: JSONObject,
+        val kind: PacketKind,
+        var retries: Int = 0
+    )
+
+    private val outboundQueue = ArrayDeque<OutboundPacket>()
     private val ackWaiting = ConcurrentHashMap<Int, InFlightChunk>()
     private val sentChunkSeqs = mutableSetOf<Int>()
     private val ackedChunkSeqs = mutableSetOf<Int>()
@@ -163,7 +212,21 @@ class TtsSyncBridge(
         var seekCount: Int = 0
     )
 
+    internal data class LegacyMetrics(
+        var writesAttempted: Int = 0,
+        var writesSucceeded: Int = 0,
+        var writesFailed: Int = 0,
+        var retries: Int = 0,
+        var reconnects: Int = 0,
+        var loadTextChunksSent: Int = 0,
+        var positionSent: Int = 0,
+        var positionDropped: Int = 0,
+        var positionCoalesced: Int = 0,
+        var avgWriteRttMs: Int = 0
+    )
+
     private val metrics = StreamMetrics()
+    private val legacyMetrics = LegacyMetrics()
     private var onDebugStateChanged: ((DebugState) -> Unit)? = null
 
     fun setDebugStateListener(listener: ((DebugState) -> Unit)?) {
@@ -215,9 +278,18 @@ class TtsSyncBridge(
         }
         sourceDocumentText = text
         lastHighlightedPayload = null
+        lastSentPosition = null
 
         if (!streamingEnabled) {
-            return buildLegacyChunks(text).isNotEmpty()
+            val chunks = buildLegacyChunks(text)
+            if (chunks.isEmpty()) return false
+            val profile = activeLegacyProfile()
+            Log.i(
+                TAG,
+                "legacy_profile active {maxPayloadBytes=${profile.maxPayloadBytes},writeIntervalMs=${profile.writeIntervalMs},positionDebounceMs=${profile.positionDebounceMs},maxInFlightWrites=${profile.maxInFlightWrites},reconnectBackoffMs=${profile.reconnectBackoffMs}}"
+            )
+            startLegacyDocumentLoad(chunks, profile)
+            return true
         }
 
         val maxJsonBytes = (transport.maxPayloadBytes() - 8).coerceAtLeast(90)
@@ -265,20 +337,26 @@ class TtsSyncBridge(
         if (positionJob?.isActive == true) return
 
         positionJob = scope.launch {
-            delay(debounceMs)
+            val debounceWindow = if (streamingEnabled) debounceMs else activeLegacyProfile().positionDebounceMs
+            delay(debounceWindow)
             val range = pendingPosition ?: return@launch
             pendingPosition = null
 
             val now = SystemClock.elapsedRealtime()
-            if (now - lastPositionSentAt < debounceMs) {
-                delay(debounceMs)
+            if (now - lastPositionSentAt < debounceWindow) {
+                delay(debounceWindow)
             }
 
             if (!streamingEnabled) {
                 if (!sendPositionPackets) {
                     sendHighlightedRangeAsLoadText(range.first, range.second)
                 } else {
-                    sendFallbackPosition(range.first, range.second)
+                    if (legacyLoadInProgress) {
+                        deferredLegacySeekDuringLoad = range
+                        legacyMetrics.positionCoalesced += 1
+                    } else {
+                        sendFallbackPosition(range.first, range.second)
+                    }
                 }
                 lastPositionSentAt = SystemClock.elapsedRealtime()
                 return@launch
@@ -492,8 +570,35 @@ class TtsSyncBridge(
             ?: chunks.lastIndex
     }
 
-    private fun enqueuePacket(packet: JSONObject) {
-        outboundQueue.add(packet)
+    private fun enqueuePacket(packet: JSONObject, kind: PacketKind = PacketKind.OTHER) {
+        val profile = activeLegacyProfile()
+        if (!streamingEnabled && kind == PacketKind.POSITION) {
+            val iterator = outboundQueue.iterator()
+            var removed = false
+            while (iterator.hasNext()) {
+                if (iterator.next().kind == PacketKind.POSITION) {
+                    iterator.remove()
+                    removed = true
+                }
+            }
+            if (removed) legacyMetrics.positionCoalesced += 1
+        }
+        if (!streamingEnabled && outboundQueue.size >= profile.queueCapacity) {
+            val iterator = outboundQueue.iterator()
+            var dropped = false
+            while (iterator.hasNext()) {
+                if (iterator.next().kind == PacketKind.POSITION) {
+                    iterator.remove()
+                    dropped = true
+                    legacyMetrics.positionDropped += 1
+                    break
+                }
+            }
+            if (!dropped) {
+                outboundQueue.removeFirstOrNull()
+            }
+        }
+        outboundQueue.add(OutboundPacket(packet = packet, kind = kind))
         publishDebugState()
         if (senderJob?.isActive != true) {
             senderJob = scope.launch { drainOutboundQueue() }
@@ -508,19 +613,39 @@ class TtsSyncBridge(
                 continue
             }
 
-            val packet = outboundQueue.removeFirstOrNull() ?: continue
+            val queued = outboundQueue.removeFirstOrNull() ?: continue
+            val packet = queued.packet
+            legacyMetrics.writesAttempted += 1
+            val startedAt = SystemClock.elapsedRealtime()
             val sent = transport.writeJson(packet)
+            val elapsed = (SystemClock.elapsedRealtime() - startedAt).toInt()
+            if (elapsed > 0) {
+                legacyMetrics.avgWriteRttMs =
+                    if (legacyMetrics.avgWriteRttMs == 0) elapsed else ((legacyMetrics.avgWriteRttMs * 4) + elapsed) / 5
+            }
             tokenBucket -= 1.0
             metrics.queueDepth = transport.pendingWriteCount()
             metrics.meanWriteLatency = transport.meanWriteLatencyMs()
             if (!sent) {
+                legacyMetrics.writesFailed += 1
                 metrics.dropped += 1
+                val profile = activeLegacyProfile()
+                if (queued.retries < profile.writeRetryLimit) {
+                    queued.retries += 1
+                    legacyMetrics.retries += 1
+                    val jitter = Random.nextLong(8, 26)
+                    delay(profile.writeTimeoutMs + jitter)
+                    outboundQueue.addFirst(queued)
+                } else if (!streamingEnabled) {
+                    attemptLegacyReconnectAndResume("bounded_write_retry_exhausted")
+                }
                 delay(35)
-            } else if (metrics.queueDepth > 6 || metrics.meanWriteLatency > 65) {
-                delay(30)
             } else {
-                delay(8)
+                legacyMetrics.writesSucceeded += 1
+                if (queued.kind == PacketKind.LOAD_TEXT) legacyMetrics.loadTextChunksSent += 1
+                if (queued.kind == PacketKind.POSITION) legacyMetrics.positionSent += 1
             }
+            if (metrics.queueDepth > 6 || metrics.meanWriteLatency > 65) delay(30) else delay(8)
             publishDebugState()
         }
     }
@@ -538,6 +663,23 @@ class TtsSyncBridge(
             else -> 30.0
         }
         tokenBucket = (tokenBucket + (elapsedMs / 1000.0) * fillRatePerSec).coerceAtMost(8.0)
+    }
+
+    private fun attemptLegacyReconnectAndResume(reason: String) {
+        val profile = activeLegacyProfile()
+        val backoff = profile.reconnectBackoffMs.getOrElse(legacyReconnectCount) { profile.reconnectBackoffMs.last() }
+        legacyReconnectCount += 1
+        legacyMetrics.reconnects += 1
+        scope.launch {
+            Log.w(TAG, "legacy_reconnect start reason=$reason backoffMs=$backoff")
+            transport.reconnectLightweight(reason)
+            delay(backoff)
+            val latest = deferredLegacySeekDuringLoad ?: lastSentPosition
+            if (latest != null) {
+                ensureLegacyChunkForOffset(latest.first)
+                sendFallbackPosition(latest.first, latest.second)
+            }
+        }
     }
 
     private fun startAckMonitorIfNeeded() {
@@ -594,6 +736,12 @@ class TtsSyncBridge(
     }
 
     private fun publishDebugState() {
+        val legacySummary =
+            "writes=${legacyMetrics.writesSucceeded}/${legacyMetrics.writesAttempted} " +
+                "failed=${legacyMetrics.writesFailed} retry=${legacyMetrics.retries} " +
+                "reconnect=${legacyMetrics.reconnects} load=${legacyMetrics.loadTextChunksSent} " +
+                "pos=${legacyMetrics.positionSent} drop=${legacyMetrics.positionDropped} " +
+                "coal=${legacyMetrics.positionCoalesced} rtt=${legacyMetrics.avgWriteRttMs}ms"
         onDebugStateChanged?.invoke(
             DebugState(
                 ackModeEnabled = ackModeEnabled,
@@ -601,66 +749,113 @@ class TtsSyncBridge(
                 committedSeq = committedSeq,
                 pendingQueue = outboundQueue.size,
                 inFlightCount = ackWaiting.size,
-                retriesCount = metrics.retries
+                retriesCount = metrics.retries,
+                legacySummary = legacySummary
             )
         )
     }
 
     private fun sendFallbackPosition(start: Int, end: Int) {
+        val docLength = sourceDocumentText.length.coerceAtLeast(0)
+        val clampedStart = start.coerceIn(0, docLength)
+        val clampedEnd = end.coerceIn(clampedStart, docLength)
+        val previous = lastSentPosition
+        if (previous != null &&
+            abs(previous.first - clampedStart) < activeLegacyProfile().meaningfulRangeDeltaChars &&
+            abs(previous.second - clampedEnd) < activeLegacyProfile().meaningfulRangeDeltaChars
+        ) {
+            legacyMetrics.positionDropped += 1
+            return
+        }
+
         val chunk = ensureLegacyChunkForOffset(start)
         val localStart = if (chunk != null) {
-            (start - chunk.startOffset).coerceIn(0, chunk.text.length)
+            (clampedStart - chunk.startOffset).coerceIn(0, chunk.text.length)
         } else {
-            start
+            clampedStart
         }
         val localEnd = if (chunk != null) {
-            (end - chunk.startOffset).coerceIn(localStart, chunk.text.length)
+            (clampedEnd - chunk.startOffset).coerceIn(localStart, chunk.text.length)
         } else {
-            end.coerceAtLeast(localStart)
+            clampedEnd.coerceAtLeast(localStart)
+        }
+        if (lastSentPosition?.first == clampedStart && lastSentPosition?.second == clampedEnd) {
+            legacyMetrics.positionDropped += 1
+            return
         }
         val packet = JSONObject()
             .put("type", "position")
             .put("docId", docId)
             .put("start", localStart)
             .put("end", localEnd)
-        enqueuePacket(packet)
+        enqueuePacket(packet, kind = PacketKind.POSITION)
+        lastSentPosition = clampedStart to clampedEnd
     }
 
     private fun buildLegacyChunks(text: String): List<LegacyChunk> {
         if (text.isBlank()) return emptyList()
-        val maxJsonBytes = (transport.maxPayloadBytes() - 8).coerceAtLeast(90)
+        val maxJsonBytes = activeLegacyProfile().maxPayloadBytes
         val chunks = buildLegacyChunkRanges(text, maxJsonBytes)
         legacyChunks = chunks
         activeLegacyChunkIndex = -1
-        ensureLegacyChunkForOffset(0)
         return chunks
+    }
+
+    private fun startLegacyDocumentLoad(chunks: List<LegacyChunk>, profile: LegacyTransportProfile) {
+        legacyLoadJob?.cancel()
+        legacyLoadInProgress = true
+        deferredLegacySeekDuringLoad = null
+        activeLegacyChunkIndex = -1
+        legacyLoadJob = scope.launch {
+            chunks.forEach { chunk ->
+                enqueuePacket(
+                    JSONObject()
+                        .put("type", "load_text")
+                        .put("docId", docId)
+                        .put("text", chunk.text),
+                    kind = PacketKind.LOAD_TEXT
+                )
+                delay(profile.writeIntervalMs)
+            }
+            delay(profile.loadQuietPeriodMs)
+            legacyLoadInProgress = false
+            val deferred = deferredLegacySeekDuringLoad
+            deferredLegacySeekDuringLoad = null
+            if (deferred != null) {
+                sendFallbackPosition(deferred.first, deferred.second)
+            } else {
+                sendFallbackPosition(0, 0)
+            }
+        }
     }
 
     private fun buildLegacyChunkRanges(text: String, maxJsonBytes: Int): List<LegacyChunk> {
         val ranges = mutableListOf<LegacyChunk>()
-        var cursor = 0
-        while (cursor < text.length) {
-            var probeEnd = (cursor + 420).coerceAtMost(text.length)
-            var accepted = -1
-            while (probeEnd > cursor) {
-                val candidate = text.substring(cursor, probeEnd)
-                if (fitsLegacyLoadTextPayload(candidate, maxJsonBytes)) {
-                    accepted = probeEnd
-                    break
+        val paragraphs = splitParagraphRanges(text)
+        paragraphs.forEach { paragraph ->
+            var cursor = paragraph.first
+            while (cursor < paragraph.second) {
+                var probeEnd = (cursor + 420).coerceAtMost(paragraph.second)
+                var accepted = -1
+                while (probeEnd > cursor) {
+                    val candidate = text.substring(cursor, probeEnd)
+                    if (fitsLegacyLoadTextPayload(candidate, maxJsonBytes)) {
+                        accepted = probeEnd
+                        break
+                    }
+                    probeEnd--
                 }
-                probeEnd--
+                if (accepted <= cursor) break
+                val boundary = preferredBoundary(text, cursor, accepted)
+                    .coerceAtLeast(cursor + 1)
+                    .coerceAtMost(paragraph.second)
+                ranges += LegacyChunk(
+                    startOffset = cursor,
+                    endOffsetExclusive = boundary,
+                    text = text.substring(cursor, boundary)
+                )
+                cursor = boundary
             }
-            if (accepted <= cursor) {
-                break
-            }
-            val boundary = preferredBoundary(text, cursor, accepted)
-            val resolvedBoundary = boundary.coerceAtLeast(cursor + 1)
-            ranges += LegacyChunk(
-                startOffset = cursor,
-                endOffsetExclusive = resolvedBoundary,
-                text = text.substring(cursor, resolvedBoundary)
-            )
-            cursor = resolvedBoundary
         }
         return ranges
     }
@@ -677,7 +872,8 @@ class TtsSyncBridge(
                 JSONObject()
                     .put("type", "load_text")
                     .put("docId", docId)
-                    .put("text", chunk.text)
+                    .put("text", chunk.text),
+                kind = PacketKind.LOAD_TEXT
             )
             activeLegacyChunkIndex = targetIndex
         }
@@ -712,6 +908,9 @@ class TtsSyncBridge(
         sourceDocumentText = ""
         legacyChunks = emptyList()
         activeLegacyChunkIndex = -1
+        legacyLoadJob?.cancel()
+        legacyLoadInProgress = false
+        deferredLegacySeekDuringLoad = null
         outboundQueue.clear()
         ackWaiting.clear()
         sentChunkSeqs.clear()
@@ -724,6 +923,7 @@ class TtsSyncBridge(
         lastAckSeq = -1
         lastSeekOffset = 0
         lastHighlightedPayload = null
+        lastSentPosition = null
         ackModeEnabled = false
         ackObservedThisSession = false
         publishDebugState()
