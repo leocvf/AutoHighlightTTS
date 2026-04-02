@@ -4,19 +4,27 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TtsSyncBridgeTest {
 
     private class FakeTransport(
-        private val maxBytes: Int = 220
+        private val maxBytes: Int = 220,
+        private val failWrites: Int = 0
     ) : TtsSyncBridge.CommandTransport {
         val packets = mutableListOf<JSONObject>()
         var queueDepth = 0
         var meanLatencyMs = 8
+        var reconnectCalls = 0
+        private var remainingFailures = failWrites
 
         override fun writeJson(packet: JSONObject): Boolean {
+            if (remainingFailures > 0) {
+                remainingFailures--
+                return false
+            }
             packets += JSONObject(packet.toString())
             return true
         }
@@ -26,6 +34,13 @@ class TtsSyncBridgeTest {
         override fun pendingWriteCount(): Int = queueDepth
 
         override fun meanWriteLatencyMs(): Int = meanLatencyMs
+
+        override fun isReady(): Boolean = true
+
+        override fun reconnectLightweight(reason: String): Boolean {
+            reconnectCalls += 1
+            return true
+        }
     }
 
     private class FakeAckSource(private val bridge: TtsSyncBridge) {
@@ -184,5 +199,61 @@ class TtsSyncBridgeTest {
         val types = transport.packets.map { it.optString("type") }
         assertTrue(types.contains("load_text"))
         assertFalse(types.contains("stream_chunk"))
+    }
+
+    @Test
+    fun legacyChunking_isDeterministicAndBounded() {
+        val transport = FakeTransport(maxBytes = 180)
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            streamingEnabled = false
+        )
+        val text = "Para one short.\n\nPara two is intentionally longer so it should split across multiple load_text packets while preserving order."
+
+        assertTrue(bridge.loadDocumentTextOnce(text))
+        Thread.sleep(120)
+        val firstRun = transport.packets.filter { it.optString("type") == "load_text" }.map { it.optString("text") }
+        transport.packets.clear()
+        assertTrue(bridge.loadDocumentTextOnce(text))
+        Thread.sleep(120)
+        val secondRun = transport.packets.filter { it.optString("type") == "load_text" }.map { it.optString("text") }
+
+        assertEquals(firstRun, secondRun)
+        assertTrue(firstRun.isNotEmpty())
+    }
+
+    @Test
+    fun legacyPosition_isCoalescedAndClamped() {
+        val transport = FakeTransport()
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            streamingEnabled = false,
+            debounceMs = 5
+        )
+        assertTrue(bridge.loadDocumentTextOnce("alpha beta gamma delta"))
+        repeat(20) { index ->
+            bridge.onSpokenRangeChanged(index, index + 200)
+        }
+        Thread.sleep(260)
+
+        val positions = transport.packets.filter { it.optString("type") == "position" }
+        assertTrue(positions.size < 8)
+        val last = positions.last()
+        assertTrue(last.optInt("end", 0) >= last.optInt("start", 0))
+        assertNotEquals(200, last.optInt("end", 0))
+    }
+
+    @Test
+    fun legacyReconnect_isTriggeredAfterBoundedRetries() {
+        val transport = FakeTransport(failWrites = 6)
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            streamingEnabled = false,
+            debounceMs = 5
+        )
+        assertTrue(bridge.loadDocumentTextOnce("one two three four five six seven eight nine"))
+        Thread.sleep(1_200)
+
+        assertTrue(transport.reconnectCalls > 0)
     }
 }

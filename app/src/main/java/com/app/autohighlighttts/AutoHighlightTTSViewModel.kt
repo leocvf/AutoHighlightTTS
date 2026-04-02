@@ -33,7 +33,7 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
     val streamingModeEnabled: StateFlow<Boolean> = _streamingModeEnabled.asStateFlow()
     private var currentDocId: String = "doc-default"
     private var ttsSyncBridge: TtsSyncBridge = createSyncBridge(_streamingModeEnabled.value)
-    private val _bleStreamDebugState = MutableStateFlow(TtsSyncBridge.DebugState(false, -1, -1, 0, 0, 0))
+    private val _bleStreamDebugState = MutableStateFlow(TtsSyncBridge.DebugState(false, -1, -1, 0, 0, 0, ""))
     val bleStreamDebugState: StateFlow<TtsSyncBridge.DebugState> = _bleStreamDebugState.asStateFlow()
 
     val connectionState: StateFlow<String> = bleManager.connectionState

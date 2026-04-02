@@ -112,6 +112,7 @@ fun TTSScreen(
         val connectionState by viewModel.connectionState.collectAsState()
         val bleStatusDetail by viewModel.bleStatusDetail.collectAsState()
         val scannedDevices by viewModel.scannedDevices.collectAsState()
+        val bleDebugState by viewModel.bleStreamDebugState.collectAsState()
         val streamingModeEnabled by viewModel.streamingModeEnabled.collectAsState()
         var pendingBleScanAfterPermission by remember { mutableStateOf(false) }
         val permissionLauncher = rememberLauncherForActivityResult(
@@ -398,7 +399,8 @@ fun TTSScreen(
                             onPing = viewModel::sendPing,
                             onClear = viewModel::sendClear,
                             onLoadSample = viewModel::loadSampleText,
-                            onPosition = viewModel::sendPosition
+                            onPosition = viewModel::sendPosition,
+                            legacySummary = bleDebugState.legacySummary
                         )
                     }
                 }
@@ -470,7 +472,8 @@ private fun BleTestPanel(
     onPing: () -> Unit,
     onClear: () -> Unit,
     onLoadSample: () -> Unit,
-    onPosition: (Int, Int) -> Unit
+    onPosition: (Int, Int) -> Unit,
+    legacySummary: String
 ) {
     var slider by remember { mutableFloatStateOf(0f) }
     var deviceMenuExpanded by remember { mutableStateOf(false) }
@@ -494,6 +497,11 @@ private fun BleTestPanel(
         Text(
             text = "Details: $statusDetail",
             fontSize = 12.sp,
+            color = Color.Gray
+        )
+        Text(
+            text = "Legacy telemetry: $legacySummary",
+            fontSize = 11.sp,
             color = Color.Gray
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

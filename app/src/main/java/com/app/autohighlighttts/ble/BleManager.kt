@@ -65,6 +65,7 @@ class BleManager(private val context: Context) {
     private var commandServiceUuid: UUID? = null
     private var lastConnectedDevice: BluetoothDevice? = null
     private var reconnectAttempts = 0
+    private var manualReconnectInProgress = false
     private var currentMtu: Int = DEFAULT_ATT_MTU
 
     private var isOperationInFlight = false
@@ -457,6 +458,33 @@ class BleManager(private val context: Context) {
     fun pendingWriteCount(): Int = writeQueue.size + if (isOperationInFlight) 1 else 0
 
     fun meanWriteLatencyMs(): Int = avgWriteLatencyMs.roundToInt()
+
+    fun isReady(): Boolean = _connectionState.value == "READY" && bluetoothGatt != null && commandCharacteristic != null
+
+    @SuppressLint("MissingPermission")
+    fun requestLightweightReconnect(reason: String): Boolean {
+        val device = lastConnectedDevice ?: return false
+        if (manualReconnectInProgress) return false
+        manualReconnectInProgress = true
+        _statusDetail.value = "Legacy reconnect requested: $reason"
+        Log.w(TAG, "requestLightweightReconnect reason=$reason")
+        bluetoothGatt?.disconnect()
+        bluetoothGatt?.close()
+        bluetoothGatt = null
+        commandCharacteristic = null
+        feedbackCharacteristic = null
+        commandServiceUuid = null
+        isOperationInFlight = false
+        writeQueue.clear()
+        mainHandler.postDelayed(
+            {
+                manualReconnectInProgress = false
+                connect(device)
+            },
+            250L
+        )
+        return true
+    }
 
     @SuppressLint("MissingPermission")
     private fun queuePayload(payload: ByteArray, rawMessage: String): Boolean {
