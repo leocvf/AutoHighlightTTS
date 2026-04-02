@@ -256,4 +256,78 @@ class TtsSyncBridgeTest {
 
         assertTrue(transport.reconnectCalls > 0)
     }
+
+    @Test
+    fun packetSender_supportsCanonicalAndCompatibilityModes() {
+        val canonical = TtsSyncBridge.PacketSender(
+            TtsSyncBridge.CompatibilityProfile(
+                useCompatibilityPayloads = false,
+                includeAliasFields = false
+            )
+        )
+        val compat = TtsSyncBridge.PacketSender(
+            TtsSyncBridge.CompatibilityProfile(
+                useCompatibilityPayloads = true,
+                includeAliasFields = true
+            )
+        )
+        val chunk = TtsSyncBridge.StreamChunk(
+            chunkId = 1,
+            sequenceId = 7,
+            startOffset = 20,
+            endOffsetExclusive = 28,
+            text = "abcdefgh",
+            checksum = 123,
+            sentenceTail = true
+        )
+
+        val canonicalChunk = canonical.streamChunk("s", "d", chunk)
+        assertEquals(7, canonicalChunk.optInt("seq"))
+        assertEquals(20, canonicalChunk.optInt("offset"))
+        assertFalse(canonicalChunk.has("sequenceId"))
+
+        val compatChunk = compat.streamChunk("s", "d", chunk)
+        assertEquals(7, compatChunk.optInt("seq"))
+        assertEquals(7, compatChunk.optInt("sequenceId"))
+        assertEquals(20, compatChunk.optInt("start"))
+    }
+
+    @Test
+    fun normalizeHighlightBounds_ordersAndCreatesOneCharWindow() {
+        val bridge = TtsSyncBridge(transport = FakeTransport())
+
+        val reversed = bridge.normalizeHighlightBounds(9, 4, 20)
+        assertEquals(4, reversed.first)
+        assertEquals(9, reversed.second)
+
+        val singlePoint = bridge.normalizeHighlightBounds(5, 5, 20)
+        assertEquals(5, singlePoint.first)
+        assertEquals(6, singlePoint.second)
+    }
+
+    @Test
+    fun ackMissing_retriesSpecificSequence() {
+        val transport = FakeTransport()
+        val bridge = TtsSyncBridge(
+            transport = transport,
+            compatibilityProfile = TtsSyncBridge.CompatibilityProfile(requireAckForCommit = true)
+        )
+        bridge.setFeedbackChannelReady(true)
+        assertTrue(bridge.loadDocumentTextOnce("One. Two. Three. Four."))
+        Thread.sleep(120)
+
+        transport.packets.clear()
+        val ack = JSONObject()
+            .put("type", "ack")
+            .put("highestContiguousSeq", 1)
+            .put("missing", org.json.JSONArray().put(2))
+            .put("bufferFillPct", 33)
+        bridge.onAckPacketReceived(ack)
+        Thread.sleep(80)
+
+        val retried = transport.packets.any {
+            it.optString("type") == "stream_chunk" && it.optInt("seq", -1) == 2
+        }
+        assertTrue(retried)
+    }
 }

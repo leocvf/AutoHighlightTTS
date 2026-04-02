@@ -11,6 +11,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -21,7 +22,7 @@ import kotlin.random.Random
 class TtsSyncBridge(
     private val transport: CommandTransport,
     private var docId: String = "demo-001",
-    private val debounceMs: Long = 150L,
+    private val debounceMs: Long = 40L,
     private val sendPositionPackets: Boolean = true,
     private val streamingEnabled: Boolean = true,
     private val streamVersion: Int = 2,
@@ -34,7 +35,7 @@ class TtsSyncBridge(
     constructor(
         bleManager: BleManager,
         docId: String = "demo-001",
-        debounceMs: Long = 150L,
+        debounceMs: Long = 40L,
         sendPositionPackets: Boolean = true,
         streamingEnabled: Boolean = true,
         streamVersion: Int = 2,
@@ -59,10 +60,88 @@ class TtsSyncBridge(
     }
 
     data class CompatibilityProfile(
+        val useCompatibilityPayloads: Boolean = true,
         val includeAliasFields: Boolean = true,
         val requireAckForCommit: Boolean = false,
         val explicitStartSeq: Boolean = true
     )
+
+    internal class PacketSender(private val compatibilityProfile: CompatibilityProfile) {
+        fun streamStart(
+            sessionId: String,
+            docId: String,
+            streamVersion: Int,
+            totalChars: Int,
+            chunkCount: Int,
+            startSeq: Int,
+            startOffset: Int = 0
+        ): JSONObject {
+            val packet = JSONObject()
+                .put("type", "stream_start")
+                .put("sessionId", sessionId)
+                .put("docId", docId)
+                .put("streamVersion", streamVersion)
+                .put("totalChars", totalChars)
+                .put("chunkCount", chunkCount)
+                .put("startOffset", startOffset)
+            if (compatibilityProfile.explicitStartSeq) {
+                packet.put("startSeq", startSeq)
+            }
+            return packet
+        }
+
+        fun streamChunk(sessionId: String, docId: String, chunk: StreamChunk): JSONObject {
+            val packet = JSONObject()
+                .put("type", "stream_chunk")
+                .put("sessionId", sessionId)
+                .put("docId", docId)
+                .put("seq", chunk.sequenceId)
+                .put("offset", chunk.startOffset)
+                .put("text", chunk.text)
+                .put("chunkId", chunk.chunkId)
+                .put("checksum", chunk.checksum)
+            if (compatibilityProfile.useCompatibilityPayloads && compatibilityProfile.includeAliasFields) {
+                packet.put("sequenceId", chunk.sequenceId)
+                packet.put("start", chunk.startOffset)
+                packet.put("end", chunk.endOffsetExclusive)
+            }
+            return packet
+        }
+
+        fun streamCommit(sessionId: String, committedSeq: Int): JSONObject {
+            val packet = JSONObject()
+                .put("type", "stream_commit")
+                .put("sessionId", sessionId)
+                .put("uptoSeq", committedSeq)
+            if (compatibilityProfile.useCompatibilityPayloads && compatibilityProfile.includeAliasFields) {
+                packet.put("committedSeq", committedSeq)
+            }
+            return packet
+        }
+
+        fun streamSeek(sessionId: String, startOffset: Int, endOffset: Int): JSONObject {
+            val packet = JSONObject()
+                .put("type", "stream_seek")
+                .put("sessionId", sessionId)
+                .put("offset", startOffset)
+            if (compatibilityProfile.useCompatibilityPayloads && compatibilityProfile.includeAliasFields) {
+                packet.put("start", startOffset)
+                packet.put("end", endOffset)
+            }
+            return packet
+        }
+
+        fun position(docId: String?, start: Int, end: Int): JSONObject {
+            val packet = JSONObject()
+                .put("type", "position")
+                .put("start", start)
+                .put("end", end)
+            if (!docId.isNullOrBlank()) {
+                packet.put("docId", docId)
+            }
+            return packet
+        }
+    }
 
     data class DebugState(
         val ackModeEnabled: Boolean,
@@ -105,6 +184,7 @@ class TtsSyncBridge(
         private const val MAX_LOOKAHEAD_CHUNKS = 5
         private const val MIN_BUFFERED_CHARS = 360
         private const val TELEMETRY_INTERVAL_MS = 500L
+        private const val POSITION_MAX_HZ_INTERVAL_MS = 40L
     }
 
     private fun activeLegacyProfile(): LegacyTransportProfile {
@@ -169,6 +249,12 @@ class TtsSyncBridge(
 
     private var tokenBucket = 4.0
     private var lastRefillMs = SystemClock.elapsedRealtime()
+    private val packetSender = PacketSender(compatibilityProfile)
+
+    internal enum class SessionState {
+        DISCONNECTED, CONNECTED_PAIRED, STREAM_START_SENT, STREAMING, STREAM_ENDED
+    }
+    private var sessionState: SessionState = SessionState.DISCONNECTED
 
     private data class StreamSession(
         val sessionId: String,
@@ -249,10 +335,18 @@ class TtsSyncBridge(
     }
 
     fun setFeedbackChannelReady(ready: Boolean) {
+        val wasReady = feedbackChannelReady
         feedbackChannelReady = ready
         if (!ready) {
             ackModeEnabled = false
             ackObservedThisSession = false
+            sessionState = SessionState.DISCONNECTED
+        } else {
+            sessionState = SessionState.CONNECTED_PAIRED
+            if (!wasReady && streamingEnabled && sourceDocumentText.isNotBlank()) {
+                Log.i(TAG, "feedback channel restored; starting fresh streaming session")
+                loadDocumentTextOnce(sourceDocumentText)
+            }
         }
         publishDebugState()
     }
@@ -269,6 +363,45 @@ class TtsSyncBridge(
         recalculateContiguousState()
         sendStreamCommit()
         publishDebugState()
+    }
+
+    fun onAckPacketReceived(packet: JSONObject) {
+        if (packet.optString("type") != "ack") return
+        val highestSeq = when {
+            packet.has("highestContiguousSeq") -> packet.optInt("highestContiguousSeq", -1)
+            packet.has("sequenceId") -> packet.optInt("sequenceId", -1)
+            else -> -1
+        }
+        val missing = when (val raw = packet.opt("missing")) {
+            is JSONArray -> (0 until raw.length()).mapNotNull { idx ->
+                raw.optInt(idx, -1).takeIf { it >= 0 }
+            }
+            else -> emptyList()
+        }
+        val bufferFillPct = packet.optInt("bufferFillPct", -1)
+        Log.d(TAG, "ack payload highest=$highestSeq missing=$missing bufferFillPct=$bufferFillPct")
+        if (highestSeq >= 0) onAckReceived(highestSeq)
+        if (missing.isNotEmpty()) {
+            retryMissingChunks(missing)
+        }
+    }
+
+    private fun retryMissingChunks(missingSeqs: List<Int>) {
+        val activeSession = session ?: return
+        val chunksBySeq = activeSession.chunks.associateBy { it.sequenceId }
+        missingSeqs.distinct().sorted().forEach { seq ->
+            val chunk = chunksBySeq[seq] ?: return@forEach
+            Log.w(TAG, "ack missing seq=$seq retrying")
+            val now = SystemClock.elapsedRealtime()
+            ackWaiting[seq] = InFlightChunk(
+                chunk = chunk,
+                lastSentAtMs = now,
+                retryCount = (ackWaiting[seq]?.retryCount ?: 0) + 1,
+                nextRetryAtMs = now + ackRetryBaseMs
+            )
+            sentChunkSeqs.remove(seq)
+            sendStreamChunk(chunk, reason = "ack_missing_retry")
+        }
     }
 
     fun loadDocumentTextOnce(text: String): Boolean {
@@ -325,6 +458,7 @@ class TtsSyncBridge(
         ackedChunkSeqs.clear()
         invalidatedChunkSeqs.clear()
         ackWaiting.clear()
+        sessionState = if (feedbackChannelReady) SessionState.CONNECTED_PAIRED else SessionState.DISCONNECTED
         sendStreamStart()
         ensureBufferAround(0)
         startAckMonitorIfNeeded()
@@ -333,37 +467,32 @@ class TtsSyncBridge(
     }
 
     fun onSpokenRangeChanged(start: Int, end: Int) {
-        pendingPosition = start to end
+        pendingPosition = normalizeHighlightBounds(start, end, sourceDocumentText.length)
         if (positionJob?.isActive == true) return
 
         positionJob = scope.launch {
-            val debounceWindow = if (streamingEnabled) debounceMs else activeLegacyProfile().positionDebounceMs
-            delay(debounceWindow)
-            val range = pendingPosition ?: return@launch
-            pendingPosition = null
-
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastPositionSentAt < debounceWindow) {
-                delay(debounceWindow)
-            }
-
-            if (!streamingEnabled) {
-                if (!sendPositionPackets) {
-                    sendHighlightedRangeAsLoadText(range.first, range.second)
-                } else {
-                    if (legacyLoadInProgress) {
+            while (isActive && pendingPosition != null) {
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - lastPositionSentAt
+                if (elapsed < POSITION_MAX_HZ_INTERVAL_MS) {
+                    delay(POSITION_MAX_HZ_INTERVAL_MS - elapsed)
+                }
+                val range = pendingPosition ?: break
+                pendingPosition = null
+                if (!streamingEnabled) {
+                    if (!sendPositionPackets) {
+                        sendHighlightedRangeAsLoadText(range.first, range.second)
+                    } else if (legacyLoadInProgress) {
                         deferredLegacySeekDuringLoad = range
                         legacyMetrics.positionCoalesced += 1
                     } else {
                         sendFallbackPosition(range.first, range.second)
                     }
+                } else {
+                    handleStreamingRange(range.first, range.second)
                 }
                 lastPositionSentAt = SystemClock.elapsedRealtime()
-                return@launch
             }
-
-            handleStreamingRange(range.first, range.second)
-            lastPositionSentAt = SystemClock.elapsedRealtime()
         }
     }
 
@@ -373,8 +502,7 @@ class TtsSyncBridge(
 
     private fun handleStreamingRange(start: Int, end: Int) {
         val currentSession = session ?: return
-        val safeStart = start.coerceIn(0, currentSession.totalChars)
-        val safeEnd = end.coerceIn(safeStart, currentSession.totalChars)
+        val (safeStart, safeEnd) = normalizeHighlightBounds(start, end, currentSession.totalChars)
         if (kotlin.math.abs(safeStart - lastSeekOffset) > 420) {
             metrics.seekCount += 1
             sendStreamSeek(safeStart, safeEnd)
@@ -387,30 +515,21 @@ class TtsSyncBridge(
 
     private fun sendStreamStart() {
         val s = session ?: return
-        val packet = JSONObject()
-            .put("type", "stream_start")
-            .put("sessionId", s.sessionId)
-            .put("docId", s.docId)
-            .put("startOffset", 0)
-            .put("streamVersion", s.streamVersion)
-            .put("totalChars", s.totalChars)
-            .put("chunkCount", s.chunks.size)
-        if (compatibilityProfile.explicitStartSeq) {
-            packet.put("startSeq", s.startSeq)
-        }
+        val packet = packetSender.streamStart(
+            sessionId = s.sessionId,
+            docId = s.docId,
+            streamVersion = s.streamVersion,
+            totalChars = s.totalChars,
+            chunkCount = s.chunks.size,
+            startSeq = s.startSeq
+        )
+        sessionState = SessionState.STREAM_START_SENT
         enqueuePacket(packet)
     }
 
     private fun sendStreamSeek(start: Int, end: Int) {
         val s = session ?: return
-        val packet = JSONObject()
-            .put("type", "stream_seek")
-            .put("sessionId", s.sessionId)
-            .put("offset", start)
-        if (compatibilityProfile.includeAliasFields) {
-            packet.put("start", start)
-            packet.put("end", end)
-        }
+        val packet = packetSender.streamSeek(s.sessionId, start, end)
         enqueuePacket(packet)
     }
 
@@ -426,13 +545,7 @@ class TtsSyncBridge(
             return
         }
 
-        val packet = JSONObject()
-            .put("type", "stream_commit")
-            .put("sessionId", s.sessionId)
-            .put("uptoSeq", committedSeq)
-        if (compatibilityProfile.includeAliasFields) {
-            packet.put("committedSeq", committedSeq)
-        }
+        val packet = packetSender.streamCommit(s.sessionId, committedSeq)
         enqueuePacket(packet)
         Log.d(
             TAG,
@@ -447,23 +560,9 @@ class TtsSyncBridge(
 
     private fun sendStreamChunk(chunk: StreamChunk, reason: String) {
         val s = session ?: return
-        val packet = JSONObject()
-            .put("type", "stream_chunk")
-            .put("sessionId", s.sessionId)
-            .put("docId", s.docId)
-            .put("seq", chunk.sequenceId)
-            .put("offset", chunk.startOffset)
-            .put("chunkId", chunk.chunkId)
-            .put("checksum", chunk.checksum)
-            .put("text", chunk.text)
-
-        if (compatibilityProfile.includeAliasFields) {
-            packet.put("sequenceId", chunk.sequenceId)
-            packet.put("start", chunk.startOffset)
-            packet.put("end", chunk.endOffsetExclusive)
-        }
-
+        val packet = packetSender.streamChunk(s.sessionId, s.docId, chunk)
         enqueuePacket(packet)
+        sessionState = SessionState.STREAMING
 
         sentChunkSeqs += chunk.sequenceId
         invalidatedChunkSeqs.remove(chunk.sequenceId)
@@ -489,6 +588,7 @@ class TtsSyncBridge(
 
     private fun sendStreamEnd() {
         val s = session ?: return
+        sessionState = SessionState.STREAM_ENDED
         enqueuePacket(
             JSONObject()
                 .put("type", "stream_end")
@@ -599,6 +699,7 @@ class TtsSyncBridge(
             }
         }
         outboundQueue.add(OutboundPacket(packet = packet, kind = kind))
+        Log.d(TAG, "enqueue_json packet=$packet")
         publishDebugState()
         if (senderJob?.isActive != true) {
             senderJob = scope.launch { drainOutboundQueue() }
@@ -618,6 +719,7 @@ class TtsSyncBridge(
             legacyMetrics.writesAttempted += 1
             val startedAt = SystemClock.elapsedRealtime()
             val sent = transport.writeJson(packet)
+            Log.d(TAG, "write_json sent=$sent packet=$packet")
             val elapsed = (SystemClock.elapsedRealtime() - startedAt).toInt()
             if (elapsed > 0) {
                 legacyMetrics.avgWriteRttMs =
@@ -757,8 +859,7 @@ class TtsSyncBridge(
 
     private fun sendFallbackPosition(start: Int, end: Int) {
         val docLength = sourceDocumentText.length.coerceAtLeast(0)
-        val clampedStart = start.coerceIn(0, docLength)
-        val clampedEnd = end.coerceIn(clampedStart, docLength)
+        val (clampedStart, clampedEnd) = normalizeHighlightBounds(start, end, docLength)
         val previous = lastSentPosition
         if (previous != null &&
             abs(previous.first - clampedStart) < activeLegacyProfile().meaningfulRangeDeltaChars &&
@@ -783,13 +884,28 @@ class TtsSyncBridge(
             legacyMetrics.positionDropped += 1
             return
         }
-        val packet = JSONObject()
-            .put("type", "position")
-            .put("docId", docId)
-            .put("start", localStart)
-            .put("end", localEnd)
+        val packet = packetSender.position(
+            docId = docId.ifBlank { null },
+            start = localStart,
+            end = localEnd.coerceAtLeast(localStart)
+        )
         enqueuePacket(packet, kind = PacketKind.POSITION)
         lastSentPosition = clampedStart to clampedEnd
+    }
+
+    internal fun normalizeHighlightBounds(start: Int, end: Int, docLength: Int): Pair<Int, Int> {
+        val safeLength = docLength.coerceAtLeast(0)
+        if (safeLength == 0) return 0 to 0
+        val clampedStart = start.coerceIn(0, safeLength - 1)
+        val clampedEndRaw = end.coerceIn(0, safeLength)
+        val orderedStart = minOf(clampedStart, clampedEndRaw)
+        val orderedEnd = max(orderedStart, clampedEndRaw)
+        val normalizedEnd = if (orderedEnd == orderedStart) {
+            (orderedStart + 1).coerceAtMost(safeLength)
+        } else {
+            orderedEnd.coerceAtMost(safeLength)
+        }
+        return orderedStart to normalizedEnd
     }
 
     private fun buildLegacyChunks(text: String): List<LegacyChunk> {
@@ -926,6 +1042,7 @@ class TtsSyncBridge(
         lastSentPosition = null
         ackModeEnabled = false
         ackObservedThisSession = false
+        sessionState = SessionState.STREAM_ENDED
         publishDebugState()
     }
 
@@ -1048,7 +1165,7 @@ class TtsSyncBridge(
             .put("chunkId", 1)
             .put("checksum", chunkText.hashCode())
             .put("text", chunkText)
-        if (compatibilityProfile.includeAliasFields) {
+        if (compatibilityProfile.useCompatibilityPayloads && compatibilityProfile.includeAliasFields) {
             probe.put("sequenceId", 1)
             probe.put("start", 0)
             probe.put("end", chunkText.length)
