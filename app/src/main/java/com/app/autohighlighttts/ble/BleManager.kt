@@ -88,6 +88,7 @@ class BleManager(private val context: Context) {
     private var serviceFilterEnabled: Boolean = true
     private var continuousScanEnabled: Boolean = false
     var onFeedbackPacket: ((JSONObject) -> Unit)? = null
+    var onFeedbackChannelReady: ((Boolean) -> Unit)? = null
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
@@ -112,6 +113,7 @@ class BleManager(private val context: Context) {
                     commandCharacteristic = null
                     feedbackCharacteristic = null
                     commandServiceUuid = null
+                    onFeedbackChannelReady?.invoke(false)
                     isOperationInFlight = false
                     writeQueue.clear()
                     bluetoothGatt?.close()
@@ -160,7 +162,7 @@ class BleManager(private val context: Context) {
                 TAG,
                 "commandCharacteristicFound=${commandCharacteristic != null} service=$commandServiceUuid characteristic=${commandCharacteristic?.uuid} fallback=$selectedByFallback"
             )
-            feedbackCharacteristic?.let { enableFeedbackNotifications(gatt, it) }
+            feedbackCharacteristic?.let { enableFeedbackNotifications(gatt, it) } ?: onFeedbackChannelReady?.invoke(false)
         }
 
         @SuppressLint("MissingPermission")
@@ -185,6 +187,19 @@ class BleManager(private val context: Context) {
             _statusDetail.value = "Last write status=$status queueRemaining=${writeQueue.size}"
             isOperationInFlight = false
             flushNextWrite()
+        }
+
+
+        @SuppressLint("MissingPermission")
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (descriptor.characteristic.uuid != X4BleUuids.X4_FEEDBACK_CHARACTERISTIC_UUID) return
+            val ready = status == BluetoothGatt.GATT_SUCCESS
+            Log.d(TAG, "onDescriptorWrite feedback status=$status ready=$ready")
+            onFeedbackChannelReady?.invoke(ready)
         }
 
         @SuppressLint("MissingPermission")

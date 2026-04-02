@@ -37,11 +37,14 @@ plus compatibility aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mi
 - Sliding window keeps a center chunk + lookahead/refill chunks buffered.
 
 ### Reliability modes
-- **ACK mode (optional):** enable retransmit on timeout using sequence IDs.
-- **Best-effort mode:** stream remains idempotent; key window chunks are resent on seek/resync.
-- Android now listens for feedback notify packets such as
-  `{"type":"ack","sequenceId":<int>}` (or `highestContiguousSeq` alias) and forwards ACK
-  sequence IDs to the stream bridge.
+- **ACK mode (gated):** ACK logic is armed only after feedback characteristic discovery,
+  notification enable success, and first valid ACK packet.
+- **Automatic fallback:** if no ACK arrives within the ACK fallback timeout after `stream_start`,
+  the current session auto-switches to non-ACK commit mode.
+- **Best-effort mode:** commit progression uses highest contiguous sent sequence when ACK mode
+  is off, so commits keep moving without feedback notifications.
+- Android listens for feedback notify packets such as
+  `{"type":"ack","sequenceId":<int>}` (or `highestContiguousSeq` alias).
 
 ### Migration and compatibility
 - Legacy `load_text` + `position` behavior remains available behind a bridge flag
@@ -49,6 +52,25 @@ plus compatibility aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mi
 - Existing `ping` and `clear` commands are unchanged for compatibility with older firmware.
 - To reduce parser ambiguity, keep one active mode per session (`stream_*` or legacy commands),
   and reset (`clear`/`stream_end`) before switching.
+
+### Compatibility profile flags (defaults)
+- `includeAliasFields=true` (temporary default): emits canonical keys (`seq`, `offset`,
+  `uptoSeq`) plus aliases (`sequenceId`, `start`, `end`, `committedSeq`) for mixed firmware.
+- `requireAckForCommit=false` (default): allows non-ACK commit progression using contiguous sent seq.
+- `explicitStartSeq=true` (default): sends `stream_start.startSeq` aligned to first chunk seq (0).
+
+### Migration plan
+1. Keep `includeAliasFields=true` until all deployed firmware parses canonical keys only.
+2. After fleet upgrade, switch `includeAliasFields=false` to reduce packet size and parser ambiguity.
+3. Enable `requireAckForCommit=true` only for firmware builds with verified feedback notifications.
+4. Keep `explicitStartSeq=true` permanently for deterministic baseline alignment.
+
+### Failure modes prevented
+- ACK-unavailable links no longer stall commit progression or trigger endless duplicate resend floods.
+- Negative commit sequence values are never transmitted.
+- Retry storms are bounded via exponential retry backoff, retry caps, and queue-depth circuit breaker.
+- Seek operations invalidate only the nearby chunk window, preventing global resend storms.
+- Telemetry emits one structured line every 500 ms to expose queue pressure, ack gap, and retries.
 
 ## Implemented behavior
 - Scans and connects to a peripheral advertising the placeholder X4 service UUID.
