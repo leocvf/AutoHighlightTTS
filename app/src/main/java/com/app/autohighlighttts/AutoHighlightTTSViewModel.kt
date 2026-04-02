@@ -46,7 +46,16 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
             ttsSyncBridge.setFeedbackChannelReady(ready)
         }
         bleManager.onFeedbackPacket = { packet ->
-            ttsSyncBridge.onAckPacketReceived(packet)
+            if (packet.optString("type") == "ack") {
+                val sequenceId = when {
+                    packet.has("sequenceId") -> packet.optInt("sequenceId", -1)
+                    packet.has("highestContiguousSeq") -> packet.optInt("highestContiguousSeq", -1)
+                    else -> -1
+                }
+                if (sequenceId >= 0) {
+                    ttsSyncBridge.onAckReceived(sequenceId)
+                }
+            }
         }
         initTTS(context)
         ttsSyncBridge.setDocId(currentDocId)
@@ -70,7 +79,6 @@ class AutoHighlightTTSViewModel @Inject constructor(@ApplicationContext context:
         ttsSyncBridge = createSyncBridge(enabled)
         ttsSyncBridge.setDebugStateListener { _bleStreamDebugState.value = it }
         bleManager.onFeedbackChannelReady = { ready -> ttsSyncBridge.setFeedbackChannelReady(ready) }
-        bleManager.onFeedbackPacket = { packet -> ttsSyncBridge.onAckPacketReceived(packet) }
         ttsSyncBridge.setDocId(currentDocId)
         ttsSyncBridge.loadDocumentTextOnce(instanceOfTTS.mainText)
     }
